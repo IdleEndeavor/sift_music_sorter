@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Sift — Tinder for Your Music Library
 
@@ -535,8 +536,7 @@ class Sift(Adw.Application):
         box.set_margin_end(48)
 
         # App icon
-        icon = Gtk.Image.new_from_file(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "sift.svg"))
+        icon = Gtk.Image.new_from_icon_name("io.github.IdleEndeavor.Sift")
         icon.set_pixel_size(128)
         icon.set_opacity(0.85)
         box.append(icon)
@@ -1152,7 +1152,7 @@ class Sift(Adw.Application):
     def _show_about(self):
         dlg = Adw.AboutDialog(
             application_name="Sift",
-            application_icon="sift-symbolic",
+            application_icon="io.github.IdleEndeavor.Sift",
             developer_name="IdleEndeavor",
             version="1.0.0",
             comments="Tinder for Your Music Library",

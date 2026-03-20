@@ -8,3 +8,4 @@ Categories=Audio;Music;GTK;
 Keywords=music;library;sort;tinder;
 StartupWMClass=sift
 X-GNOME-UsesNotifications=false
+StartupWMClass=io.github.IdleEndeavor.Sift
