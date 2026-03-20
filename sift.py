@@ -295,7 +295,15 @@ class Spectrogram(Gtk.DrawingArea):
     Computed in a background thread so it doesn't block the UI.
     """
 
-    N_BARS = 80
+    @property
+    def N_BARS(self):
+        width = self.get_allocated_width()
+        if width < 100:
+            return 40
+        elif width < 250:
+            return 60
+        else:
+            return 80
     H      = 52
     FG     = (0.18, 0.78, 0.49)  # accent green, matches .heart-btn
     DIM    = (0.38, 0.38, 0.42)
@@ -346,6 +354,10 @@ class Spectrogram(Gtk.DrawingArea):
         hx   = w * self._pos
         r    = min(bw * 0.28, 2.2)
 
+        # Skip drawing if bars would be invisible
+        if bw < 2:
+            return
+
         for i, v in enumerate(bars):
             x  = i * bw
             bh = max(3, v * (h - 8))
@@ -357,7 +369,7 @@ class Spectrogram(Gtk.DrawingArea):
             else:
                 cr.set_source_rgba(*self.DIM, 0.40 if self._bars else 0.18)
 
-            # Rounded rectangle for each bar
+            # Rounded rectangle
             cr.arc(x + r + 1,        y + r,      r, math.pi,         3 * math.pi / 2)
             cr.arc(x + bw - r - 1,   y + r,      r, 3 * math.pi / 2, 0)
             cr.arc(x + bw - r - 1,   y + bh - r, r, 0,               math.pi / 2)
