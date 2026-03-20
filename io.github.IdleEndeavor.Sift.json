@@ -1,0 +1,49 @@
+{
+  "id": "io.github.IdleEndeavor.Sift",
+  "runtime": "org.gnome.Platform",
+  "runtime-version": "47",
+  "sdk": "org.gnome.Sdk",
+  "command": "sift",
+  "finish-args": [
+    "--share=network",
+    "--share=ipc",
+    "--socket=fallback-x11",
+    "--socket=wayland",
+    "--socket=pulseaudio",
+    "--device=dri",
+    "--filesystem=xdg-music",
+    "--filesystem=xdg-config/sift:create"
+  ],
+  "modules": [
+    {
+      "name": "python3-deps",
+      "buildsystem": "simple",
+      "build-commands": [
+        "pip3 install --prefix=/app librosa soundfile mutagen requests send2trash"
+      ],
+      "sources": [
+        {
+          "type": "shell",
+          "commands": ["echo 'deps placeholder'"]
+        }
+      ]
+    },
+    {
+      "name": "sift",
+      "buildsystem": "simple",
+      "build-commands": [
+        "install -Dm755 sift.py /app/bin/sift",
+        "install -Dm644 sift.svg /app/share/icons/hicolor/scalable/apps/io.github.IdleEndeavor.Sift.svg",
+        "install -Dm644 sift-symbolic.svg /app/share/icons/hicolor/symbolic/apps/io.github.IdleEndeavor.Sift-symbolic.svg",
+        "install -Dm644 io.github.IdleEndeavor.Sift.desktop /app/share/applications/io.github.IdleEndeavor.Sift.desktop",
+        "install -Dm644 io.github.IdleEndeavor.Sift.metainfo.xml /app/share/metainfo/io.github.IdleEndeavor.Sift.metainfo.xml"
+      ],
+      "sources": [
+        {
+          "type": "dir",
+          "path": "."
+        }
+      ]
+    }
+  ]
+}

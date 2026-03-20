@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.IdleEndeavor.Sift</id>
+
+  <name>Sift</name>
+  <summary>Tinder for Your Music Library</summary>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <description>
+    <p>
+      Sift is a keyboard-driven music library weeder for GNOME. It plays the
+      chorus of each track in your library and lets you quickly decide to keep
+      it, trash it, or skip it — all without lifting your hands from the keyboard.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Automatic chorus detection via LRCLIB synced lyrics or librosa energy analysis</li>
+      <li>Mel-spectrogram visualiser with live playhead</li>
+      <li>Dashboard to review liked and trashed songs</li>
+      <li>Configurable workspace folder for storing your lists</li>
+      <li>Session memory — resumes where you left off</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">io.github.IdleEndeavor.Sift.desktop</launchable>
+
+  <url type="homepage">https://github.com/IdleEndeavor/sift_music_sorter</url>
+  <url type="bugtracker">https://github.com/IdleEndeavor/sift_music_sorter/issues</url>
+
+  <developer id="io.github.IdleEndeavor">
+    <name>IdleEndeavor</name>
+  </developer>
+
+  <provides>
+    <binary>sift</binary>
+  </provides>
+
+  <screenshots>
+  <screenshot type="default">
+    <caption>Judging songs in the player view</caption>
+    <image>https://raw.githubusercontent.com/IdleEndeavor/sift_music_sorter/main/app-screenshot-1.png</image>
+  </screenshot>
+</screenshots>
+
+  <releases>
+    <release version="1.0.0" date="2026-03-20">
+      <description>
+        <p>Initial release.</p>
+      </description>
+    </release>
+  </releases>
+
+  <content_rating type="oars-1.1"/>
+
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+
+  <recommends>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </recommends>
+
+  <categories>
+    <category>Audio</category>
+    <category>Music</category>
+  </categories>
+
+  <keywords>
+    <keyword>music</keyword>
+    <keyword>library</keyword>
+    <keyword>sort</keyword>
+    <keyword>tinder</keyword>
+    <keyword>chorus</keyword>
+  </keywords>
+</component>

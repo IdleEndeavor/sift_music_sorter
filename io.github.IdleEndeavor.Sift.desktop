@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Sift
+Comment=Tinder for Your Music Library
+Exec=sift
+Icon=io.github.IdleEndeavor.Sift
+Type=Application
+Categories=Audio;Music;GTK;
+Keywords=music;library;sort;tinder;
+StartupWMClass=sift
+X-GNOME-UsesNotifications=false

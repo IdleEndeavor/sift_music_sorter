@@ -1,0 +1,32 @@
+# ── Flatpak build artefacts ───────────────────────────────────────────────────
+build-dir/
+.flatpak-builder/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+
+# ── Sift runtime data ─────────────────────────────────────────────────────────
+# Workspace files (liked/trash lists and session state) are personal data
+# and should not be committed — they live in ~/Music/sift-workspace by default
+sift_liked.txt
+sift_trash.txt
+sift_state.json
+
+# App config (workspace path preference)
+# Lives in ~/.config/sift/ normally, but guard against it ending up here
+config.json
+
+# ── Editor / OS noise ─────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Lunacy project file ───────────────────────────────────────────────────────
+# The exported SVGs are what matters; the .free source file is large and binary
+*.free
