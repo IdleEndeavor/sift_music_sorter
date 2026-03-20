@@ -395,6 +395,34 @@
       ]
     },
     {
+      "name": "python3-llvmlite",
+      "buildsystem": "simple",
+      "build-commands": [
+        "pip3 install --verbose --exists-action=i --no-index --find-links=\"file://${PWD}\" --prefix=${FLATPAK_DEST} --no-deps \"llvmlite\""
+      ],
+      "sources": [
+        {
+          "type": "file",
+          "url": "https://files.pythonhosted.org/packages/62/af/c3df8a3f26c3cff7730ab1cb7c7a4c899f8c4fb4acd9020150d1599575ac/llvmlite-0.42.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+          "sha256": "d47494552559e00d81bfb836cf1c4d5a5062e54102cc5767d5aa1e77ccd2505c"
+        }
+      ]
+    },
+    {
+      "name": "python3-numba",
+      "buildsystem": "simple",
+      "build-commands": [
+        "pip3 install --verbose --exists-action=i --no-index --find-links=\"file://${PWD}\" --prefix=${FLATPAK_DEST} --no-deps \"numba\""
+      ],
+      "sources": [
+        {
+          "type": "file",
+          "url": "https://files.pythonhosted.org/packages/47/ab/ef2605f0463889ea8934feb84ac71c3b3c562bd25bb0fda690ba46ee2fbe/numba-0.59.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+          "sha256": "f7ad1d217773e89a9845886401eaaab0a156a90aa2f179fdc125261fd1105096"
+        }
+      ]
+    },
+    {
       "name": "python3-librosa",
       "buildsystem": "simple",
       "build-commands": [
@@ -422,8 +450,8 @@
         {
           "type": "git",
           "url": "https://github.com/IdleEndeavor/sift_music_sorter",
-          "tag": "v1.0.0",
-          "commit": "dc6262fb8b2260f6318fb784e772acd6d4112abe"
+          "tag": "v1.0.2",
+          "commit": "PASTE_HASH_HERE"
         }
       ]
     }

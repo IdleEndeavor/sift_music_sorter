@@ -297,7 +297,7 @@ class Spectrogram(Gtk.DrawingArea):
 
     @property
     def N_BARS(self):
-        width = self.get_allocated_width()
+        width = self.get_width()
         if width < 100:
             return 40
         elif width < 250:
