@@ -420,8 +420,10 @@
       ],
       "sources": [
         {
-          "type": "dir",
-          "path": "."
+          "type": "git",
+          "url": "https://github.com/IdleEndeavor/sift_music_sorter",
+          "tag": "v1.0.0",
+          "commit": "dc6262fb8b2260f6318fb784e772acd6d4112abe"
         }
       ]
     }
