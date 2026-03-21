@@ -1,10 +1,12 @@
 # Sift
-
 **Tinder for your Music Library**
 
 Sift is a keyboard-driven music library weeder for GNOME. It plays the chorus of each track in your library and lets you quickly decide to keep it, trash it, or skip it — all without lifting your hands from the keyboard.
 
-![Sift in action](media/app-screenshot-1.png)
+<table><tr>
+<td width="50%"><video src="https://github.com/user-attachments/assets/53bd9c31-d558-41bb-acb2-5e566f5dbdd7" controls width="100%"></video></td>
+<td width="50%"><img src="media/app-screenshot-1.png" width="100%"></td>
+</tr></table>
 
 ---
 
@@ -25,12 +27,6 @@ Sift scans a folder you choose, then plays the most recognisable part of each tr
 Chorus detection uses [LRCLIB](https://lrclib.net) synced lyrics where available, falling back to librosa RMS energy analysis. Results are shown as a live mel-spectrogram visualiser.
 
 Your kept and trashed songs are saved to a workspace folder (`~/Music/sift-workspace` by default), so your decisions persist across sessions.
-
----
-
-## Demo
-
-https://github.com/IdleEndeavor/sift_music_sorter/raw/main/media/app-running-example.mp4
 
 ---
 
