@@ -21,6 +21,7 @@
       <li>Dashboard to review liked and trashed songs</li>
       <li>Configurable workspace folder for storing your lists</li>
       <li>Session memory — resumes where you left off</li>
+      <li>Full song metadata viewer</li>
     </ul>
   </description>
 
@@ -33,18 +34,23 @@
     <name>IdleEndeavor</name>
   </developer>
 
+  <screenshots>
+    <screenshot type="default">
+      <caption>Judging songs in the player view</caption>
+      <image>https://raw.githubusercontent.com/IdleEndeavor/sift_music_sorter/main/media/app-screenshot-1.png</image>
+    </screenshot>
+  </screenshots>
+
   <provides>
     <binary>sift</binary>
   </provides>
 
-  <screenshots>
-  <screenshot type="default">
-    <caption>Judging songs in the player view</caption>
-    <image>https://raw.githubusercontent.com/IdleEndeavor/sift_music_sorter/main/app-screenshot-1.png</image>
-  </screenshot>
-</screenshots>
-
   <releases>
+    <release version="1.0.2" date="2026-03-21">
+      <description>
+        <p>Fixed spectrogram rendering in Flatpak sandbox. Added numba support for improved analysis performance.</p>
+      </description>
+    </release>
     <release version="1.0.0" date="2026-03-20">
       <description>
         <p>Initial release.</p>
