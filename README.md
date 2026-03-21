@@ -32,7 +32,7 @@ Your kept and trashed songs are saved to a workspace folder (`~/Music/sift-works
 
 ## Demo
 
-https://github.com/IdleEndeavor/sift_music_sorter/raw/main/media/app-running-example.mp4
+<video src="media/app-running-example.mp4" controls width="100%"></video>
 
 ---
 
