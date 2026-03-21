@@ -18,6 +18,7 @@ import tempfile
 import shutil
 import atexit
 import threading
+import datetime
 from collections import Counter
 from contextlib import contextmanager
 
@@ -46,37 +47,31 @@ Gst.init(None)
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-# GLib-dependent constants must come after the import above
 
 CLIP_DIR  = os.path.join(tempfile.gettempdir(), "sift_clips")
 CLIP_SECS = 30
 SR        = 22050
 
-# File names used within the workspace
-LIKED_NAME = "sift_liked.txt"
-TRASH_NAME = "sift_trash.txt"
-STATE_NAME = "sift_state.json"
+LIKED_NAME   = "sift_liked.txt"
+TRASH_NAME   = "sift_trash.txt"
+STATE_NAME   = "sift_state.json"
+STATS_NAME   = "sift_stats.json"
 
-# App config lives in ~/.config/sift/ — separate from the workspace so it
-# survives workspace changes
 _CONFIG_DIR  = os.path.join(GLib.get_user_config_dir(), "sift")
 APP_CFG_FILE = os.path.join(_CONFIG_DIR, "config.json")
 
-# Default workspace — ~/Music/sift-workspace
 _DEFAULT_WORKSPACE = os.path.join(
     GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_MUSIC)
     or os.path.expanduser("~/Music"),
     "sift-workspace",
 )
 
-# Clean up temp clips on exit
 atexit.register(lambda: shutil.rmtree(CLIP_DIR, ignore_errors=True))
 
 
 # ── App config helpers ────────────────────────────────────────────────────────
 
 def load_config() -> dict:
-    """Load persistent app config (workspace path, etc.)."""
     try:
         with open(APP_CFG_FILE) as f:
             return json.load(f)
@@ -84,7 +79,6 @@ def load_config() -> dict:
         return {}
 
 def save_config(data: dict) -> None:
-    """Save persistent app config."""
     os.makedirs(_CONFIG_DIR, exist_ok=True)
     with open(APP_CFG_FILE, "w") as f:
         json.dump(data, f, indent=2)
@@ -92,17 +86,53 @@ def save_config(data: dict) -> None:
 
 # ── Workspace helpers ─────────────────────────────────────────────────────────
 
-def workspace_paths(workspace: str) -> tuple[str, str, str]:
-    """Return (liked_file, trash_file, state_file) for a given workspace path."""
+def workspace_paths(workspace: str) -> tuple[str, str, str, str]:
+    """Return (liked_file, trash_file, state_file, stats_file) for a workspace."""
     return (
         os.path.join(workspace, LIKED_NAME),
         os.path.join(workspace, TRASH_NAME),
         os.path.join(workspace, STATE_NAME),
+        os.path.join(workspace, STATS_NAME),
     )
 
 def ensure_workspace(workspace: str) -> None:
-    """Create the workspace directory if it doesn't exist."""
     os.makedirs(workspace, exist_ok=True)
+
+
+# ── Stats persistence ─────────────────────────────────────────────────────────
+
+_EMPTY_STATS = {
+    "library": {
+        "judged": 0, "kept": 0, "trashed": 0, "skipped": 0,
+        "artists": {}, "genres": {},
+    },
+    "new_music": {
+        "judged": 0, "kept": 0, "trashed": 0, "skipped": 0,
+        "artists": {}, "genres": {},
+    },
+    "deleted": [],   # list of {path, size, deleted_at}
+}
+
+def load_stats(fname: str) -> dict:
+    """Load stats from workspace. Returns a fresh empty stats dict if missing."""
+    try:
+        with open(fname) as f:
+            data = json.load(f)
+        # Ensure all keys exist (forward compat)
+        for mode in ("library", "new_music"):
+            data.setdefault(mode, dict(_EMPTY_STATS[mode]))
+            for k in ("judged", "kept", "trashed", "skipped", "artists", "genres"):
+                data[mode].setdefault(k, {} if k in ("artists", "genres") else 0)
+        data.setdefault("deleted", [])
+        return data
+    except Exception:
+        return json.loads(json.dumps(_EMPTY_STATS))
+
+def save_stats(fname: str, stats: dict) -> None:
+    tmp = fname + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(stats, f, indent=2)
+    os.replace(tmp, fname)
 
 
 # ── LRC / lyrics helpers ──────────────────────────────────────────────────────
@@ -110,7 +140,6 @@ def ensure_workspace(workspace: str) -> None:
 _LRC_RE = re.compile(r"\[(\d+):(\d+\.\d+)\](.*)")
 
 def _parse_lrc(text: str) -> list[tuple[float, str]]:
-    """Parse an LRC string into a list of (timestamp_seconds, line) tuples."""
     out = []
     for line in text.splitlines():
         m = _LRC_RE.match(line.strip())
@@ -120,10 +149,6 @@ def _parse_lrc(text: str) -> list[tuple[float, str]]:
     return out
 
 def _chorus_from_lrc(lines: list[tuple[float, str]]) -> float | None:
-    """
-    Find the chorus start by looking for the first repeated lyric line.
-    Ignores anything in the first 20 seconds to skip repeated intro tags.
-    """
     if not lines:
         return None
     counts     = Counter(txt.lower().strip() for _, txt in lines)
@@ -136,7 +161,6 @@ def _chorus_from_lrc(lines: list[tuple[float, str]]) -> float | None:
 # ── Chorus detection ──────────────────────────────────────────────────────────
 
 def _lrclib_start(title: str, artist: str, duration: float) -> float | None:
-    """Query LRCLIB for synced lyrics and extract the chorus timestamp."""
     if not _HAS_REQUESTS or not title or not artist:
         return None
     try:
@@ -156,10 +180,6 @@ def _lrclib_start(title: str, artist: str, duration: float) -> float | None:
         return None
 
 def _librosa_start(y: np.ndarray, sr: int) -> float:
-    """
-    Fallback: find the start of the most energetic 30-second window,
-    biased toward the middle 15-80% of the track to avoid intros/outros.
-    """
     hop    = 512
     rms    = librosa.feature.rms(y=y, hop_length=hop)[0]
     times  = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop)
@@ -177,7 +197,6 @@ def _librosa_start(y: np.ndarray, sr: int) -> float:
 
 def find_start(path: str, title: str, artist: str,
                y: np.ndarray, sr: int, duration: float) -> tuple[float, str]:
-    """Try LRCLIB first, fall back to librosa. Returns (start_sec, method)."""
     t = _lrclib_start(title, artist, duration)
     if t is not None:
         print(f"[lrclib]  {os.path.basename(path)} → {t:.1f}s")
@@ -190,10 +209,6 @@ def find_start(path: str, title: str, artist: str,
 # ── Clip extraction ───────────────────────────────────────────────────────────
 
 def extract_clip(src: str, start: float) -> str | None:
-    """
-    Write a CLIP_SECS WAV excerpt to CLIP_DIR starting at `start` seconds.
-    Used as a GStreamer seek fallback if the main seek fails.
-    """
     try:
         os.makedirs(CLIP_DIR, exist_ok=True)
         base = os.path.splitext(os.path.basename(src))[0]
@@ -211,18 +226,17 @@ def extract_clip(src: str, start: float) -> str | None:
 # ── Mutagen / tag helpers ─────────────────────────────────────────────────────
 
 def _cover_bytes(path: str) -> bytes | None:
-    """Extract cover art bytes from FLAC, MP3, or M4A. Returns None if absent."""
     try:
         f = MutagenFile(path, easy=False)
         if f is None:
             return None
-        if hasattr(f, "pictures") and f.pictures:       # FLAC / Ogg
+        if hasattr(f, "pictures") and f.pictures:
             return f.pictures[0].data
-        if isinstance(f, MP3):                           # MP3 ID3 APIC
+        if isinstance(f, MP3):
             frames = ID3(path).getall("APIC")
             if frames:
                 return frames[0].data
-        if hasattr(f, "tags") and f.tags:               # M4A covr
+        if hasattr(f, "tags") and f.tags:
             v = f.tags.get("covr")
             if v:
                 return bytes(v[0])
@@ -231,7 +245,6 @@ def _cover_bytes(path: str) -> bytes | None:
     return None
 
 def _tag(audio, *keys) -> str:
-    """Safely read the first matching tag key from a mutagen object."""
     if audio is None:
         return ""
     for k in keys:
@@ -241,7 +254,6 @@ def _tag(audio, *keys) -> str:
     return ""
 
 def read_tags(path: str) -> tuple[str, str, float]:
-    """Return (title, artist, duration) for a given audio file path."""
     try:
         f      = MutagenFile(path, easy=True)
         title  = _tag(f, "title") or os.path.splitext(os.path.basename(path))[0]
@@ -255,21 +267,18 @@ def read_tags(path: str) -> tuple[str, str, float]:
 # ── Persistence helpers ───────────────────────────────────────────────────────
 
 def load_set(fname: str) -> set:
-    """Load a line-separated text file into a set. Returns empty set if missing."""
     if os.path.exists(fname):
         with open(fname) as f:
             return {l.strip() for l in f if l.strip()}
     return set()
 
 def save_set(fname: str, songs: set) -> None:
-    """Atomically rewrite a set of paths to a text file."""
     tmp = fname + ".tmp"
     with open(tmp, "w") as f:
         f.writelines(s + "\n" for s in sorted(songs))
     os.replace(tmp, fname)
 
 def load_state(fname: str) -> dict:
-    """Load saved session state (last music folder, last index)."""
     try:
         with open(fname) as f:
             return json.load(f)
@@ -277,13 +286,27 @@ def load_state(fname: str) -> dict:
         return {}
 
 def save_state(fname: str, data: dict) -> None:
-    """Persist session state to disk."""
     with open(fname, "w") as f:
         json.dump(data, f)
 
 def safe_uri(path: str) -> str:
-    """Convert a filesystem path to a properly encoded file:// URI for GStreamer."""
     return GLib.filename_to_uri(os.path.abspath(path), None)
+
+
+# ── Size formatting ───────────────────────────────────────────────────────────
+
+def _file_size_bytes(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except Exception:
+        return 0
+
+def _fmt_bytes(b: int) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if b < 1024:
+            return f"{b:.1f} {unit}"
+        b /= 1024
+    return f"{b:.1f} TB"
 
 
 # ── Spectrogram widget ────────────────────────────────────────────────────────
@@ -304,9 +327,10 @@ class Spectrogram(Gtk.DrawingArea):
             return 60
         else:
             return 80
-    H      = 52
-    FG     = (0.18, 0.78, 0.49)  # accent green, matches .heart-btn
-    DIM    = (0.38, 0.38, 0.42)
+
+    H   = 52
+    FG  = (0.18, 0.78, 0.49)
+    DIM = (0.38, 0.38, 0.42)
 
     def __init__(self):
         super().__init__()
@@ -317,7 +341,6 @@ class Spectrogram(Gtk.DrawingArea):
         self._path: str | None  = None
 
     def load(self, path: str):
-        """Start computing spectrogram for a new track."""
         self._bars = []
         self._path = path
         self._pos  = 0.0
@@ -325,13 +348,11 @@ class Spectrogram(Gtk.DrawingArea):
         threading.Thread(target=self._compute, args=(path,), daemon=True).start()
 
     def set_pos(self, pos_s: float, dur_s: float):
-        """Update the playhead position (called every 500ms from the tick timer)."""
         if dur_s > 0:
             self._pos = max(0.0, min(1.0, pos_s / dur_s))
             self.queue_draw()
 
     def _compute(self, path: str):
-        """Background thread: load audio, compute mel spectrogram, reduce to N_BARS bins."""
         try:
             y, sr  = librosa.load(path, sr=SR, mono=True, duration=120)
             mel    = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=64)
@@ -348,13 +369,11 @@ class Spectrogram(Gtk.DrawingArea):
             print(f"[spectrogram] {e}")
 
     def _draw(self, _area, cr, w, h):
-        """Cairo draw callback. Renders rounded bars and a white playhead line."""
         bars = self._bars or [0.15] * self.N_BARS
         bw   = w / len(bars)
         hx   = w * self._pos
         r    = min(bw * 0.28, 2.2)
 
-        # Skip drawing if bars would be invisible
         if bw < 2:
             return
 
@@ -369,7 +388,6 @@ class Spectrogram(Gtk.DrawingArea):
             else:
                 cr.set_source_rgba(*self.DIM, 0.40 if self._bars else 0.18)
 
-            # Rounded rectangle
             cr.arc(x + r + 1,        y + r,      r, math.pi,         3 * math.pi / 2)
             cr.arc(x + bw - r - 1,   y + r,      r, 3 * math.pi / 2, 0)
             cr.arc(x + bw - r - 1,   y + bh - r, r, 0,               math.pi / 2)
@@ -377,7 +395,6 @@ class Spectrogram(Gtk.DrawingArea):
             cr.close_path()
             cr.fill()
 
-        # Playhead line
         if self._bars:
             cr.set_source_rgba(1, 1, 1, 0.65)
             cr.set_line_width(1.5)
@@ -397,8 +414,6 @@ class Sift(Adw.Application):
         )
         self.player = Gst.ElementFactory.make("playbin", "player")
 
-        # Playback queue and analysis results
-        # cache maps path → (start_sec, clip_path | None, method)
         self.queue:   list[str]                               = []
         self.cache:   dict[str, tuple[float, str | None, str]] = {}
         self.pending: set[str]                                = set()
@@ -407,47 +422,131 @@ class Sift(Adw.Application):
         self.music_dir = ""
         self.history:    list[tuple[str, str]] = []
 
-        # Load app config first — this tells us where the workspace is
+        # New music mode — plays full songs, forgets folder when done
+        self._new_music_mode: bool = False
+
         cfg = load_config()
         self.workspace = cfg.get("workspace", _DEFAULT_WORKSPACE)
 
-        # Ensure the workspace exists and derive file paths from it
         ensure_workspace(self.workspace)
-        self._liked_file, self._trash_file, self._state_file = \
+        self._liked_file, self._trash_file, self._state_file, self._stats_file = \
             workspace_paths(self.workspace)
 
-        # Liked / trashed song sets, loaded from disk on startup
         self.liked = load_set(self._liked_file)
         self.trash = load_set(self._trash_file)
+        self._stats = load_stats(self._stats_file)
 
-        # Restore last session if available
+        self._backfill_stats()
+
         state           = load_state(self._state_file)
         self._saved_dir = state.get("dir", "")
         self._saved_idx = state.get("index", 0)
 
         self._seek_id: int = 0
-
-        # Tracks checked paths per dashboard tab: {"liked": set(), "trash": set()}
         self._dash_selection: dict[str, set] = {"liked": set(), "trash": set()}
+
+    # ── Stats recording ───────────────────────────────────────────────────────
+
+    def _mode_key(self) -> str:
+        """Return the stats key for the current mode."""
+        return "new_music" if self._new_music_mode else "library"
+
+    def _record_decision(self, kind: str, path: str) -> None:
+        """Record a judging decision to persistent stats."""
+        mode = self._mode_key()
+        self._stats[mode]["judged"] += 1
+        if kind == "heart":
+            self._stats[mode]["kept"] += 1
+        elif kind == "trash":
+            self._stats[mode]["trashed"] += 1
+        elif kind == "skip":
+            self._stats[mode]["skipped"] += 1
+
+        # Artist and genre counts
+        try:
+            f      = MutagenFile(path, easy=True)
+            artist = _tag(f, "artist") or "Unknown Artist"
+            genre  = _tag(f, "genre")  or "Unknown"
+        except Exception:
+            artist = "Unknown Artist"
+            genre  = "Unknown"
+
+        artists = self._stats[mode]["artists"]
+        artists[artist] = artists.get(artist, 0) + 1
+
+        genres = self._stats[mode]["genres"]
+        genres[genre] = genres.get(genre, 0) + 1
+
+        save_stats(self._stats_file, self._stats)
+
+    def _record_deletion(self, path: str, size_bytes: int) -> None:
+        """Append a deletion record to stats."""
+        self._stats["deleted"].append({
+            "path":       path,
+            "size":       size_bytes,
+            "deleted_at": datetime.datetime.now().isoformat(),
+        })
+        save_stats(self._stats_file, self._stats)
+
+    def _backfill_stats(self) -> None:
+        """
+        Populate stats from existing liked/trash lists if stats are empty.
+        Only runs once — marks itself done in the stats file so it doesn't
+        double-count on subsequent launches.
+        """
+        if self._stats.get("backfilled"):
+            return
+
+        for path in self.liked:
+            try:
+                f      = MutagenFile(path, easy=True)
+                artist = _tag(f, "artist") or "Unknown Artist"
+                genre  = _tag(f, "genre")  or "Unknown"
+            except Exception:
+                artist = "Unknown Artist"
+                genre  = "Unknown"
+
+            self._stats["library"]["judged"] += 1
+            self._stats["library"]["kept"]   += 1
+            self._stats["library"]["artists"][artist] = \
+                self._stats["library"]["artists"].get(artist, 0) + 1
+            self._stats["library"]["genres"][genre] = \
+                self._stats["library"]["genres"].get(genre, 0) + 1
+
+        for path in self.trash:
+            try:
+                f      = MutagenFile(path, easy=True)
+                artist = _tag(f, "artist") or "Unknown Artist"
+                genre  = _tag(f, "genre")  or "Unknown"
+            except Exception:
+                artist = "Unknown Artist"
+                genre  = "Unknown"
+
+            self._stats["library"]["judged"]  += 1
+            self._stats["library"]["trashed"] += 1
+            self._stats["library"]["artists"][artist] = \
+                self._stats["library"]["artists"].get(artist, 0) + 1
+            self._stats["library"]["genres"][genre] = \
+                self._stats["library"]["genres"].get(genre, 0) + 1
+
+        self._stats["backfilled"] = True
+        save_stats(self._stats_file, self._stats)
 
 
     # ── Workspace management ──────────────────────────────────────────────────
 
     def _set_workspace(self, new_path: str) -> None:
-        """
-        Switch to a new workspace directory.
-        Saves current lists first, then reloads from the new location.
-        """
         save_set(self._liked_file, self.liked)
         save_set(self._trash_file, self.trash)
 
         self.workspace = new_path
         ensure_workspace(self.workspace)
-        self._liked_file, self._trash_file, self._state_file = \
+        self._liked_file, self._trash_file, self._state_file, self._stats_file = \
             workspace_paths(self.workspace)
 
-        self.liked = load_set(self._liked_file)
-        self.trash = load_set(self._trash_file)
+        self.liked  = load_set(self._liked_file)
+        self.trash  = load_set(self._trash_file)
+        self._stats = load_stats(self._stats_file)
 
         state           = load_state(self._state_file)
         self._saved_dir = state.get("dir", "")
@@ -457,7 +556,6 @@ class Sift(Adw.Application):
         self._toast(f"Workspace set to {os.path.basename(new_path)}")
 
     def _pick_workspace(self) -> None:
-        """Open a folder picker to let the user choose a new workspace."""
         dialog = Gtk.FileDialog.new()
         dialog.set_title("Choose Workspace Folder")
         dialog.select_folder(self.win, None, self._workspace_chosen)
@@ -472,14 +570,12 @@ class Sift(Adw.Application):
             self._set_workspace(folder.get_path())
 
     def _reset_workspace(self) -> None:
-        """Reset the workspace back to the default ~/Music/sift-workspace."""
         self._set_workspace(_DEFAULT_WORKSPACE)
 
 
     # ── App startup ───────────────────────────────────────────────────────────
 
     def do_activate(self):
-        # Register the local icon directory so sift-symbolic.svg is found
         icon_theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
         icon_theme.add_search_path(os.path.dirname(os.path.abspath(__file__)))
 
@@ -487,14 +583,12 @@ class Sift(Adw.Application):
         self.win.set_default_size(700, 850)
         self.win.set_title("Sift")
 
-        # Global keyboard handler
         kc = Gtk.EventControllerKey.new()
         kc.connect("key-pressed", self._key)
         self.win.add_controller(kc)
 
         self._css()
 
-        # Root stack — setup / player / dashboard
         self.stack = Gtk.Stack()
         self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
         self.stack.add_named(self._build_setup(),     "setup")
@@ -502,12 +596,10 @@ class Sift(Adw.Application):
         self.stack.add_named(self._build_dashboard(), "dashboard")
         self.stack.connect("notify::visible-child", self._on_screen_changed)
 
-        # Toast overlay wraps the whole stack so toasts show on any screen
         self.toast_overlay = Adw.ToastOverlay()
         self.toast_overlay.set_child(self.stack)
         self.win.set_content(self.toast_overlay)
 
-        # Auto-resume last session if the saved folder still exists
         if self._saved_dir and os.path.isdir(self._saved_dir):
             self.music_dir = self._saved_dir
             self._index_library(resume_idx=self._saved_idx)
@@ -518,7 +610,6 @@ class Sift(Adw.Application):
         self.win.present()
 
     def _css(self):
-        """Load application-wide CSS overrides."""
         p = Gtk.CssProvider()
         p.load_from_data(b"""
             .action-btn  { border-radius: 99px; min-width: 78px;  min-height: 78px;  }
@@ -533,7 +624,6 @@ class Sift(Adw.Application):
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
     def _on_screen_changed(self, _stack, _param):
-        """Grab focus to the play button whenever the player screen becomes visible."""
         if self.stack.get_visible_child_name() == "player":
             self.play_btn.grab_focus()
 
@@ -541,16 +631,35 @@ class Sift(Adw.Application):
     # ── Setup screen ──────────────────────────────────────────────────────────
 
     def _build_setup(self) -> Gtk.Widget:
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+
+        # Header bar with close button
+        hdr = Adw.HeaderBar()
+        hdr.add_css_class("flat")
+        hdr.set_show_end_title_buttons(False)
+
+        close_btn = Gtk.Button(icon_name="window-close-symbolic")
+        close_btn.set_tooltip_text("Quit Sift")
+        close_btn.connect("clicked", lambda _: self.quit())
+        hdr.pack_end(close_btn)
+        root.append(hdr)
+
+        # Scrollable centred content
+        scroll = Gtk.ScrolledWindow(vexpand=True)
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+
         box = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL,
             spacing=8,
             halign=Gtk.Align.CENTER,
             valign=Gtk.Align.CENTER,
         )
+        box.set_vexpand(True)
         box.set_margin_start(48)
         box.set_margin_end(48)
+        box.set_margin_top(24)
+        box.set_margin_bottom(24)
 
-        # App icon
         icon = Gtk.Image.new_from_icon_name("io.github.IdleEndeavor.Sift")
         icon.set_pixel_size(128)
         icon.set_opacity(0.85)
@@ -558,7 +667,6 @@ class Sift(Adw.Application):
 
         box.append(self._spacer(8))
 
-        # Title and tagline
         title = Gtk.Label(label="Sift")
         title.add_css_class("title-1")
         box.append(title)
@@ -570,12 +678,35 @@ class Sift(Adw.Application):
 
         box.append(self._spacer(20))
 
-        # Folder and dashboard buttons
+        # ── Mode toggle ───────────────────────────────────────────────────
+        mode_box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=0,
+            halign=Gtk.Align.CENTER,
+        )
+        mode_box.add_css_class("linked")
+
+        self._mode_library_btn = Gtk.ToggleButton(label="Judge Library")
+        self._mode_library_btn.set_active(True)
+        self._mode_library_btn.set_tooltip_text(
+            "Seek to the chorus of each song and judge your library")
+
+        self._mode_new_btn = Gtk.ToggleButton(label="New Music")
+        self._mode_new_btn.set_tooltip_text(
+            "Play full songs from the start — forgets folder when done")
+        self._mode_new_btn.set_group(self._mode_library_btn)
+
+        mode_box.append(self._mode_library_btn)
+        mode_box.append(self._mode_new_btn)
+        box.append(mode_box)
+
+        box.append(self._spacer(8))
+
+        # ── Main buttons ──────────────────────────────────────────────────
         pick = Gtk.Button(label="Select Music Folder")
         pick.add_css_class("suggested-action")
         pick.add_css_class("pill")
-        pick.connect("clicked", lambda _:
-            Gtk.FileDialog.new().select_folder(self.win, None, self._folder_chosen))
+        pick.connect("clicked", lambda _: self._pick_folder_for_mode())
         box.append(pick)
 
         dash = Gtk.Button(label="Library Dashboard")
@@ -585,7 +716,6 @@ class Sift(Adw.Application):
 
         box.append(self._spacer(20))
 
-        # Quick keyboard reference
         instructions = Adw.PreferencesGroup(title="How to use")
         for key, desc in [
             ("→  Keep",  "Like the song and move on"),
@@ -598,7 +728,9 @@ class Sift(Adw.Application):
             instructions.add(row)
         box.append(instructions)
 
-        return box
+        scroll.set_child(box)
+        root.append(scroll)
+        return root
 
 
     # ── Player screen ─────────────────────────────────────────────────────────
@@ -606,7 +738,6 @@ class Sift(Adw.Application):
     def _build_player(self) -> Gtk.Widget:
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
 
-        # Header bar
         hdr = Adw.HeaderBar()
         hdr.add_css_class("flat")
 
@@ -621,12 +752,21 @@ class Sift(Adw.Application):
         menu_btn.set_menu_model(self._build_menu())
         hdr.pack_end(menu_btn)
 
+        # Title shows mode; counter shows songs left
+        self._player_title_lbl = Gtk.Label(label="Judge Library")
+        self._player_title_lbl.add_css_class("heading")
         self.lbl_counter = Gtk.Label(label="")
         self.lbl_counter.add_css_class("caption")
-        hdr.set_title_widget(self.lbl_counter)
+        self.lbl_counter.set_opacity(0.6)
+
+        title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        title_box.set_halign(Gtk.Align.CENTER)
+        title_box.append(self._player_title_lbl)
+        title_box.append(self.lbl_counter)
+        hdr.set_title_widget(title_box)
+
         root.append(hdr)
 
-        # Centred content column
         col = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL,
             spacing=14,
@@ -639,7 +779,6 @@ class Sift(Adw.Application):
         col.set_margin_start(40)
         col.set_margin_end(40)
 
-        # Cover art
         self.cover_frame = Gtk.AspectFrame(ratio=1.0, obey_child=False)
         self.cover_frame.set_size_request(320, 320)
         self.cover_frame.add_css_class("cover-frame")
@@ -649,7 +788,6 @@ class Sift(Adw.Application):
         self.cover_frame.set_child(self.cover_pic)
         col.append(self.cover_frame)
 
-        # Song title and artist name
         meta = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         self.lbl_title = Gtk.Label()
         self.lbl_title.add_css_class("title-2")
@@ -666,18 +804,15 @@ class Sift(Adw.Application):
         meta.append(self.lbl_artist)
         col.append(meta)
 
-        # Small badge showing which method found the chorus (lrclib / librosa)
         self.lbl_method = Gtk.Label()
         self.lbl_method.add_css_class("caption")
         self.lbl_method.set_opacity(0.38)
         col.append(self.lbl_method)
 
-        # Spectrogram visualiser
         self.spectro = Spectrogram()
         self.spectro.set_size_request(380, Spectrogram.H)
         col.append(self.spectro)
 
-        # Elapsed / total time
         trow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         trow.set_size_request(380, -1)
         self.lbl_pos = Gtk.Label(label="0:00")
@@ -690,7 +825,6 @@ class Sift(Adw.Application):
         trow.append(self.lbl_dur)
         col.append(trow)
 
-        # Seek bar
         self.seek = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
         self.seek.set_draw_value(False)
         self.seek.set_size_request(380, -1)
@@ -698,8 +832,6 @@ class Sift(Adw.Application):
         col.append(self.seek)
         GLib.timeout_add(500, self._tick_position)
 
-        # Action buttons
-        # Layout: [undo] [trash] [play/skip] [heart] [info]
         btns = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL,
             spacing=26,
@@ -716,7 +848,6 @@ class Sift(Adw.Application):
                                 ["action-btn", "trash-btn"], "Trash  ←")
         trash_btn.connect("clicked", lambda _: self._action("trash"))
 
-        # Play and skip stacked vertically in the centre
         mid = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         self.play_btn = self._mkbtn("media-playback-pause-symbolic",
                                     ["play-btn"], "Play/Pause  Space")
@@ -758,18 +889,25 @@ class Sift(Adw.Application):
         self._dash_stack = Adw.ViewStack()
         self._liked_lb   = self._song_listbox()
         self._trash_lb   = self._song_listbox()
+        self._stats_content_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        self._stats_content_box.set_margin_top(16)
+        self._stats_content_box.set_margin_bottom(16)
+        self._stats_content_box.set_margin_start(16)
+        self._stats_content_box.set_margin_end(16)
 
-        def _scroll(lb):
+        def _scroll(child):
             s = Gtk.ScrolledWindow(vexpand=True)
-            s.set_child(lb)
+            s.set_child(child)
             return s
 
         self._dash_stack.add_titled_with_icon(
-            _scroll(self._liked_lb), "liked", "Liked", "starred-symbolic")
+            _scroll(self._liked_lb),          "liked", "Liked",      "starred-symbolic")
         self._dash_stack.add_titled_with_icon(
-            _scroll(self._trash_lb), "trash", "Trashed", "user-trash-symbolic")
+            _scroll(self._trash_lb),          "trash", "Trashed",    "user-trash-symbolic")
+        self._dash_stack.add_titled_with_icon(
+            _scroll(self._stats_content_box), "stats", "Statistics", "chart-line-symbolic")
 
-        # Clear selection when switching tabs
         self._dash_stack.connect("notify::visible-child", self._on_dash_tab_changed)
 
         switcher = Adw.ViewSwitcher()
@@ -787,7 +925,7 @@ class Sift(Adw.Application):
         root.append(hdr)
         root.append(self._dash_stack)
 
-        # Bottom action bar — hidden until something is selected
+        # Bottom action bar
         self._dash_action_bar = Gtk.ActionBar()
 
         select_all_btn = Gtk.Button(label="Select All")
@@ -814,21 +952,136 @@ class Sift(Adw.Application):
 
         root.append(self._dash_action_bar)
         return root
-    
+
+
+    # ── Statistics page ───────────────────────────────────────────────────────
+
+    def _refresh_stats(self):
+        """Recompute and redraw the statistics page from stored + live data."""
+        while (child := self._stats_content_box.get_first_child()):
+            self._stats_content_box.remove(child)
+
+        s  = self._stats
+        lib = s["library"]
+        nm  = s["new_music"]
+        deleted = s["deleted"]
+
+        total_judged  = lib["judged"]  + nm["judged"]
+        total_kept    = lib["kept"]    + nm["kept"]
+        total_trashed = lib["trashed"] + nm["trashed"]
+        total_skipped = lib["skipped"] + nm["skipped"]
+        total_pct_t   = (total_trashed / total_judged * 100) if total_judged else 0.0
+        total_pct_k   = (total_kept    / total_judged * 100) if total_judged else 0.0
+
+        # Live file sizes
+        liked_size       = sum(_file_size_bytes(p) for p in self.liked if os.path.exists(p))
+        trash_on_disk    = [p for p in self.trash if os.path.exists(p)]
+        trash_on_disk_sz = sum(_file_size_bytes(p) for p in trash_on_disk)
+        deleted_count = sum(r.get("count", 1) for r in deleted)
+        deleted_size     = sum(r.get("size", 0) for r in deleted)
+
+        # Combined artist / genre counts
+        combined_artists: dict[str, int] = {}
+        combined_genres:  dict[str, int] = {}
+        for mode_key in ("library", "new_music"):
+            for artist, count in s[mode_key]["artists"].items():
+                combined_artists[artist] = combined_artists.get(artist, 0) + count
+            for genre, count in s[mode_key]["genres"].items():
+                combined_genres[genre] = combined_genres.get(genre, 0) + count
+
+        top_artists = sorted(combined_artists.items(), key=lambda x: x[1], reverse=True)[:5]
+        top_genres  = sorted(combined_genres.items(),  key=lambda x: x[1], reverse=True)[:5]
+
+        def _group(title: str, description: str = "") -> Adw.PreferencesGroup:
+            g = Adw.PreferencesGroup()
+            g.set_title(title)
+            if description:
+                g.set_description(description)
+            return g
+
+        def _row(title: str, value: str) -> Adw.ActionRow:
+            row = Adw.ActionRow()
+            row.set_title(title)
+            lbl = Gtk.Label(label=value)
+            lbl.add_css_class("body")
+            lbl.set_valign(Gtk.Align.CENTER)
+            row.add_suffix(lbl)
+            return row
+
+        if total_judged == 0:
+            lbl = Gtk.Label(label="No songs judged yet. Start sifting!")
+            lbl.add_css_class("body")
+            lbl.set_opacity(0.5)
+            self._stats_content_box.append(lbl)
+            return
+
+        # ── Total Overview ────────────────────────────────────────────────
+        ov = _group("Total Overview")
+        ov.add(_row("Total Judged",   str(total_judged)))
+        ov.add(_row("Kept",           f"{total_kept} ({total_pct_k:.1f}%)"))
+        ov.add(_row("Trashed",        f"{total_trashed} ({total_pct_t:.1f}%)"))
+        ov.add(_row("Skipped",        str(total_skipped)))
+        ov.add(_row("Liked Library Size", _fmt_bytes(liked_size)))
+        self._stats_content_box.append(ov)
+
+        # ── Space ─────────────────────────────────────────────────────────
+        sp = _group("Space",
+            "Files marked as trash but still on disk can be deleted from the Trashed tab.")
+        sp.add(_row("Deleted from Disk",
+                    f"{deleted_count} files · {_fmt_bytes(deleted_size)} freed"))
+        sp.add(_row("Marked Trash Still on Disk",
+                    f"{len(trash_on_disk)} files · {_fmt_bytes(trash_on_disk_sz)} reclaimable"))
+        self._stats_content_box.append(sp)
+
+        # ── By Mode ───────────────────────────────────────────────────────
+        modes_group = _group("By Mode")
+
+        def _mode_pct(kept, trashed, judged):
+            if judged == 0:
+                return "—"
+            return f"{judged} judged · {kept} kept · {trashed} trashed"
+
+        modes_group.add(_row("Judge Library",
+                             _mode_pct(lib["kept"], lib["trashed"], lib["judged"])))
+        modes_group.add(_row("New Music",
+                             _mode_pct(nm["kept"], nm["trashed"], nm["judged"])))
+        self._stats_content_box.append(modes_group)
+
+        # ── Top Artists ───────────────────────────────────────────────────
+        if top_artists:
+            ag = _group("Most Judged Artists")
+            for artist, count in top_artists:
+                ag.add(_row(GLib.markup_escape_text(artist),
+                            f"{count} song{'s' if count != 1 else ''}"))
+            self._stats_content_box.append(ag)
+
+        # ── Top Genres ────────────────────────────────────────────────────
+        if top_genres:
+            gg = _group("Top Genres")
+            for genre, count in top_genres:
+                gg.add(_row(GLib.markup_escape_text(genre),
+                            f"{count} song{'s' if count != 1 else ''}"))
+            self._stats_content_box.append(gg)
+
+
+    # ── Dashboard helpers ─────────────────────────────────────────────────────
+
     def _current_dash_kind(self) -> str:
-        """Return which tab is currently visible — 'liked' or 'trash'."""
         name = self._dash_stack.get_visible_child_name()
         return name if name in ("liked", "trash") else "liked"
 
     def _on_dash_tab_changed(self, _stack, _param):
-        """Clear selection when the user switches tabs."""
-        self._dash_selection["liked"].clear()
-        self._dash_selection["trash"].clear()
-        self._update_dash_action_bar()
-        self._refresh_dash()
+        name = self._dash_stack.get_visible_child_name()
+        if name == "stats":
+            self._refresh_stats()
+            self._dash_action_bar.set_revealed(False)
+        else:
+            self._dash_selection["liked"].clear()
+            self._dash_selection["trash"].clear()
+            self._update_dash_action_bar()
+            self._refresh_dash()
 
     def _dash_toggle(self, checkbox: Gtk.CheckButton, path: str, kind: str):
-        """Called when a row checkbox is toggled."""
         if checkbox.get_active():
             self._dash_selection[kind].add(path)
         else:
@@ -836,7 +1089,6 @@ class Sift(Adw.Application):
         self._update_dash_action_bar()
 
     def _dash_select_all(self):
-        """Select all visible rows in the current tab."""
         kind = self._current_dash_kind()
         source = self.liked if kind == "liked" else self.trash
         self._dash_selection[kind] = set(source)
@@ -844,20 +1096,17 @@ class Sift(Adw.Application):
         self._refresh_dash()
 
     def _update_dash_action_bar(self):
-        """Show or hide the action bar based on current selection count."""
+        if self._dash_stack.get_visible_child_name() == "stats":
+            self._dash_action_bar.set_revealed(False)
+            return
         kind  = self._current_dash_kind()
         count = len(self._dash_selection[kind])
         self._dash_action_bar.set_revealed(count > 0)
         self._dash_selection_label.set_text(
             f"{count} song{'s' if count != 1 else ''} selected")
-        # Restore button only makes sense on the trash tab
         self._dash_restore_btn.set_visible(kind == "trash")
-        # Un-like button only makes sense on the liked tab
-        self._dash_delete_btn.set_label(
-            "Move to Trash" if kind in ("liked", "trash") else "Move to Trash")
 
     def _dash_bulk_delete(self):
-        """Confirm then send all selected songs to system trash."""
         kind  = self._current_dash_kind()
         paths = list(self._dash_selection[kind])
         if not paths:
@@ -874,7 +1123,8 @@ class Sift(Adw.Application):
         dlg.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
         dlg.set_default_response("cancel")
         dlg.set_close_response("cancel")
-        dlg.connect("response", lambda d, r, p=paths, k=kind: self._dash_bulk_delete_confirmed(d, r, p, k))
+        dlg.connect("response", lambda d, r, p=paths, k=kind:
+                    self._dash_bulk_delete_confirmed(d, r, p, k))
         dlg.present(self.win)
 
     def _dash_bulk_delete_confirmed(self, _d, resp: str, paths: list, kind: str):
@@ -883,7 +1133,9 @@ class Sift(Adw.Application):
         failed = []
         for path in paths:
             try:
+                size = _file_size_bytes(path)
                 send2trash(path)
+                self._record_deletion(path, size)
                 s = self.liked if kind == "liked" else self.trash
                 f = self._liked_file if kind == "liked" else self._trash_file
                 s.discard(path)
@@ -903,7 +1155,6 @@ class Sift(Adw.Application):
         self._toast(f"{count} file{'s' if count != 1 else ''} moved to trash")
 
     def _dash_bulk_restore(self):
-        """Restore all selected trashed songs back to the judging queue."""
         paths = list(self._dash_selection["trash"])
         if not paths:
             return
@@ -940,7 +1191,6 @@ class Sift(Adw.Application):
         self._fill_lb(self._trash_lb, sorted(self.trash),  "trash")
 
     def _fill_lb(self, lb: Gtk.ListBox, paths: list, kind: str):
-        """Clear and repopulate a dashboard listbox."""
         while (r := lb.get_row_at_index(0)) is not None:
             lb.remove(r)
         if not paths:
@@ -950,7 +1200,6 @@ class Sift(Adw.Application):
             lb.append(self._song_row(p, kind))
 
     def _song_row(self, path: str, kind: str) -> Gtk.Widget:
-        """Build a single dashboard row with checkbox, restore/un-like, and delete buttons."""
         title, artist, _ = read_tags(path)
         exists = os.path.exists(path)
 
@@ -960,7 +1209,6 @@ class Sift(Adw.Application):
         if not exists:
             row.set_sensitive(False)
 
-        # Checkbox on the left
         check = Gtk.CheckButton()
         check.set_active(path in self._dash_selection[kind])
         check.set_valign(Gtk.Align.CENTER)
@@ -999,7 +1247,6 @@ class Sift(Adw.Application):
         return row
 
     def _rescue(self, path: str):
-        """Move a song out of trash and back to the front of the judging queue."""
         self.trash.discard(path)
         save_set(self._trash_file, self.trash)
         if os.path.exists(path) and path not in self.queue:
@@ -1008,7 +1255,6 @@ class Sift(Adw.Application):
         self._toast("Song restored to queue")
 
     def _unlike(self, path: str):
-        """Remove a song from liked and send it back to the judging queue."""
         self.liked.discard(path)
         save_set(self._liked_file, self.liked)
         if os.path.exists(path) and path not in self.queue:
@@ -1017,7 +1263,6 @@ class Sift(Adw.Application):
         self._toast("Song removed from liked")
 
     def _confirm_delete(self, path: str, kind: str):
-        """Show a confirmation dialog before sending a file to the system trash."""
         dlg = Adw.AlertDialog(
             heading="Move to trash?",
             body=f"{os.path.basename(path)}\n\nThe file will be moved to your system trash.",
@@ -1034,7 +1279,9 @@ class Sift(Adw.Application):
         if resp != "delete":
             return
         try:
+            size = _file_size_bytes(path)
             send2trash(path)
+            self._record_deletion(path, size)
         except Exception as e:
             print(f"[delete] {e}")
             return
@@ -1054,7 +1301,6 @@ class Sift(Adw.Application):
     # ── Song info dialog ──────────────────────────────────────────────────────
 
     def _show_info(self):
-        """Show a dialog with full tag and file metadata for the current song."""
         if self.idx >= len(self.queue):
             return
         path = self.queue[self.idx]
@@ -1121,9 +1367,9 @@ class Sift(Adw.Application):
             ("Format",       os.path.splitext(path)[1].lstrip(".").upper()),
             ("Path",         path),
             ("Workspace",    self.workspace),
+            ("Mode",         "New Music" if self._new_music_mode else "Judge Library"),
         ]
 
-        # Two-column grid: field name on left, value on right (both left-aligned)
         grid = Gtk.Grid()
         grid.set_column_spacing(24)
         grid.set_row_spacing(8)
@@ -1173,7 +1419,6 @@ class Sift(Adw.Application):
     # ── Hamburger menu ────────────────────────────────────────────────────────
 
     def _build_menu(self) -> Gio.MenuModel:
-        """Build the app menu and register its actions."""
         menu = Gio.Menu()
         menu.append("Preferences",        "app.preferences")
         menu.append("Keyboard Shortcuts", "app.shortcuts")
@@ -1192,7 +1437,6 @@ class Sift(Adw.Application):
         return menu
 
     def _show_preferences(self):
-        """Show a preferences dialog for folder and workspace settings."""
         dlg = Adw.PreferencesDialog()
         dlg.set_title("Preferences")
 
@@ -1200,7 +1444,6 @@ class Sift(Adw.Application):
         page.set_title("General")
         page.set_icon_name("preferences-system-symbolic")
 
-        # ── Music folder ──────────────────────────────────────────────────
         folder_group = Adw.PreferencesGroup()
         folder_group.set_title("Music Folder")
         folder_group.set_description("The folder Sift scans for tracks to judge.")
@@ -1232,11 +1475,10 @@ class Sift(Adw.Application):
         folder_group.add(folder_row)
         page.add(folder_group)
 
-        # ── Workspace ─────────────────────────────────────────────────────
         ws_group = Adw.PreferencesGroup()
         ws_group.set_title("Workspace")
         ws_group.set_description(
-            "Where Sift stores your liked list, trash list, and session state. "
+            "Where Sift stores your liked list, trash list, session state, and statistics. "
             "Defaults to ~/Music/sift-workspace."
         )
 
@@ -1270,7 +1512,6 @@ class Sift(Adw.Application):
         dlg.present(self.win)
 
     def _show_shortcuts(self):
-        """Show the standard GNOME keyboard shortcuts window."""
         section = Gtk.ShortcutsSection(section_name="main", title="Sift")
         section.set_property("max-height", 12)
 
@@ -1307,7 +1548,7 @@ class Sift(Adw.Application):
             application_name="Sift",
             application_icon="io.github.IdleEndeavor.Sift",
             developer_name="IdleEndeavor",
-            version="1.2.0",
+            version="1.3.0",
             comments="Tinder for Your Music Library",
             website="https://github.com/IdleEndeavor/sift_music_sorter",
             issue_url="https://github.com/IdleEndeavor/sift_music_sorter/issues",
@@ -1339,7 +1580,6 @@ class Sift(Adw.Application):
     # ── Library indexing ──────────────────────────────────────────────────────
 
     def _index_library(self, resume_idx: int = 0):
-        """Walk the music folder and build the judging queue, excluding already-decided songs."""
         exts  = (".flac", ".mp3", ".wav", ".ogg", ".m4a", ".opus")
         files = []
         for root, _, names in os.walk(self.music_dir):
@@ -1354,7 +1594,11 @@ class Sift(Adw.Application):
         self._analyse_ahead()
 
     def _analyse_ahead(self):
-        """Background: analyse the next 10 un-cached songs ahead of the current index."""
+        """Background: analyse the next 10 un-cached songs.
+        Skipped entirely in new music mode."""
+        if self._new_music_mode:
+            return
+
         def work():
             count = 0
             for i in range(self.idx, len(self.queue)):
@@ -1385,23 +1629,35 @@ class Sift(Adw.Application):
     # ── Song loading ──────────────────────────────────────────────────────────
 
     def _load_song(self):
-        """Load and start playing the song at the current queue index."""
+        # Update the player header title to reflect current mode
+        mode_label = "New Music" if self._new_music_mode else "Judge Library"
+        self._player_title_lbl.set_text(mode_label)
+
         if self.idx >= len(self.queue):
-            self.lbl_title.set_text("All done!")
-            self.lbl_artist.set_text("Your library is sifted ✓")
-            self.lbl_counter.set_text("")
-            self.lbl_method.set_text("")
-            self.cover_pic.set_paintable(None)
             self.player.set_state(Gst.State.NULL)
-            self._toast("Library fully sifted!", timeout=4)
+            if self._new_music_mode:
+                self._new_music_mode = False
+                self.music_dir = ""
+                self._forget_folder(None)
+                self._toast("All new music judged!", timeout=3)
+                GLib.timeout_add(1500, lambda: (
+                    self.stack.set_visible_child_name("setup"), False))
+            else:
+                self.lbl_title.set_text("All done!")
+                self.lbl_artist.set_text("Your library is sifted ✓")
+                self.lbl_counter.set_text("")
+                self.lbl_method.set_text("")
+                self.cover_pic.set_paintable(None)
+                self._toast("Library fully sifted!", timeout=4)
             return
 
         path      = self.queue[self.idx]
         remaining = len(self.queue) - self.idx
-        self.lbl_counter.set_text(f"{remaining} song{'s' if remaining != 1 else ''} left")
-        self.lbl_method.set_text("analysing…")
+        self.lbl_counter.set_text(
+            f"{remaining} song{'s' if remaining != 1 else ''} left")
 
-        # set_text is always plain-text safe — no markup escaping needed
+        self.lbl_method.set_text("full song" if self._new_music_mode else "analysing…")
+
         title, artist, _ = read_tags(path)
         self.lbl_title.set_text(title)
         self.lbl_artist.set_text(artist or "Unknown Artist")
@@ -1422,15 +1678,18 @@ class Sift(Adw.Application):
         self.player.set_property("uri", safe_uri(path))
         self.player.set_state(Gst.State.PLAYING)
         self._set_play_icon(True)
-        self._wait_for_analysis(path, 0)
 
-        save_state(self._state_file, {"dir": self.music_dir, "index": self.idx})
+        if self._new_music_mode:
+            # Play from the beginning — no chorus seeking
+            pass
+        else:
+            self._wait_for_analysis(path, 0)
+            save_state(self._state_file, {"dir": self.music_dir, "index": self.idx})
 
 
     # ── Playback position ─────────────────────────────────────────────────────
 
     def _tick_position(self) -> bool:
-        """Called every 500ms to update the seek bar, time labels, and spectrogram."""
         ok_d, dur = self.player.query_duration(Gst.Format.TIME)
         ok_p, pos = self.player.query_position(Gst.Format.TIME)
         if ok_d and ok_p:
@@ -1444,7 +1703,6 @@ class Sift(Adw.Application):
         return True
 
     def _seek_manual(self, _s):
-        """Called when the user drags the seek bar (signal blocked during auto-update)."""
         self.player.seek_simple(
             Gst.Format.TIME,
             Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
@@ -1452,7 +1710,6 @@ class Sift(Adw.Application):
 
     @contextmanager
     def _no_seek_signal(self):
-        """Block the seek bar's value-changed signal to prevent feedback loops."""
         self.seek.handler_block(self._seek_id)
         try:
             yield
@@ -1463,10 +1720,6 @@ class Sift(Adw.Application):
     # ── Chorus seeking ────────────────────────────────────────────────────────
 
     def _wait_for_analysis(self, path: str, attempts: int):
-        """
-        Poll until the background analysis is done, then seek to the chorus.
-        Gives up after 20 attempts (~10 seconds) to avoid waiting forever.
-        """
         if not self.queue or self.idx >= len(self.queue) \
                 or self.queue[self.idx] != path:
             return
@@ -1485,11 +1738,6 @@ class Sift(Adw.Application):
             lambda: self._wait_for_analysis(path, attempts + 1) or False)
 
     def _seek_to(self, path: str, start: float, clip: str | None):
-        """
-        Seek GStreamer to the chorus timestamp.
-        If the seek fails (can happen on some files), fall back to playing
-        the pre-extracted WAV clip from CLIP_DIR.
-        """
         if not self.queue or self.idx >= len(self.queue) \
                 or self.queue[self.idx] != path:
             return
@@ -1525,7 +1773,6 @@ class Sift(Adw.Application):
         self._commit(kind)
 
     def _commit(self, kind: str):
-        """Record a heart / trash / skip decision and advance to the next song."""
         if self.idx >= len(self.queue):
             return
         path = self.queue[self.idx]
@@ -1535,11 +1782,11 @@ class Sift(Adw.Application):
         elif kind == "trash":
             self.trash.add(path)
             save_set(self._trash_file, self.trash)
+        self._record_decision(kind, path)
         self.history.append((kind, path))
         self._next()
 
     def _undo(self):
-        """Undo the last heart / trash / skip and step back one song."""
         if not self.history:
             self._toast("Nothing to undo")
             return
@@ -1550,6 +1797,18 @@ class Sift(Adw.Application):
         elif kind == "trash":
             self.trash.discard(path)
             save_set(self._trash_file, self.trash)
+
+        # Reverse the stats record
+        mode = self._mode_key()
+        self._stats[mode]["judged"] = max(0, self._stats[mode]["judged"] - 1)
+        if kind == "heart":
+            self._stats[mode]["kept"] = max(0, self._stats[mode]["kept"] - 1)
+        elif kind == "trash":
+            self._stats[mode]["trashed"] = max(0, self._stats[mode]["trashed"] - 1)
+        elif kind == "skip":
+            self._stats[mode]["skipped"] = max(0, self._stats[mode]["skipped"] - 1)
+        save_stats(self._stats_file, self._stats)
+
         self.idx = max(0, self.idx - 1)
         self.seek.clear_marks()
         self._toast(f"Undid {kind}")
@@ -1564,6 +1823,11 @@ class Sift(Adw.Application):
 
     # ── Folder management ─────────────────────────────────────────────────────
 
+    def _pick_folder_for_mode(self):
+        """Open folder picker using whichever mode toggle is active."""
+        self._new_music_mode = self._mode_new_btn.get_active()
+        Gtk.FileDialog.new().select_folder(self.win, None, self._folder_chosen)
+
     def _folder_chosen(self, dialog, result):
         try:
             folder = dialog.select_folder_finish(result)
@@ -1574,8 +1838,13 @@ class Sift(Adw.Application):
             return
         self.music_dir = folder.get_path()
         self._toast(f"Loaded {os.path.basename(self.music_dir)}")
-        resume = self._saved_idx if self.music_dir == self._saved_dir else 0
-        self._index_library(resume_idx=resume)
+
+        if self._new_music_mode:
+            self._index_library(resume_idx=0)
+        else:
+            resume = self._saved_idx if self.music_dir == self._saved_dir else 0
+            self._index_library(resume_idx=resume)
+
         if self.queue:
             self.stack.set_visible_child_name("player")
             self._load_song()
@@ -1583,16 +1852,16 @@ class Sift(Adw.Application):
             self._toast("No music files found in that folder")
 
     def _go_setup(self):
-        """Stop playback and return to the folder picker."""
         self.player.set_state(Gst.State.NULL)
+        self._new_music_mode = False
         self.stack.set_visible_child_name("setup")
 
     def _forget_folder(self, _btn):
-        """Clear the saved folder so the app starts fresh next launch."""
         self._saved_dir = ""
         self._saved_idx = 0
         save_state(self._state_file, {})
-        self._toast("Saved folder cleared")
+        if _btn is not None:
+            self._toast("Saved folder cleared")
 
 
     # ── Toast helper ──────────────────────────────────────────────────────────
@@ -1621,7 +1890,6 @@ class Sift(Adw.Application):
 
     @staticmethod
     def _mkbtn(icon: str, classes: list, tip: str) -> Gtk.Button:
-        """Create an icon button with the given CSS classes and tooltip."""
         b = Gtk.Button()
         b.set_child(Gtk.Image.new_from_icon_name(icon))
         for c in classes:
@@ -1631,7 +1899,6 @@ class Sift(Adw.Application):
 
     @staticmethod
     def _spacer(height: int) -> Gtk.Box:
-        """Create an invisible vertical spacer of a given pixel height."""
         s = Gtk.Box()
         s.set_size_request(-1, height)
         return s
