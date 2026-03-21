@@ -450,8 +450,8 @@
         {
           "type": "git",
           "url": "https://github.com/IdleEndeavor/sift_music_sorter",
-          "tag": "v1.0.2",
-          "commit": "8e189cd28d571bc45ff905ab8a9a4ba1baa01b56"
+          "tag": "v1.2.0",
+          "commit": "876a186a400bcba31fdffb6c52ea9d3264cbfb3d"
         }
       ]
     }
