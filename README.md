@@ -3,7 +3,7 @@
 
 Sift is a keyboard-driven music library weeder for GNOME. It plays the chorus of each track in your library and lets you quickly decide to keep it, trash it, or skip it — all without lifting your hands from the keyboard.
 
-https://github.com/IdleEndeavor/sift_music_sorter/raw/main/media/app-running-example.mp4
+https://github.com/user-attachments/assets/53bd9c31-d558-41bb-acb2-5e566f5dbdd7
 
 ![Sift in action](media/app-screenshot-1.png)
 
