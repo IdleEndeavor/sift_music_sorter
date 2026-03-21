@@ -427,6 +427,9 @@ class Sift(Adw.Application):
 
         self._seek_id: int = 0
 
+        # Tracks checked paths per dashboard tab: {"liked": set(), "trash": set()}
+        self._dash_selection: dict[str, set] = {"liked": set(), "trash": set()}
+
 
     # ── Workspace management ──────────────────────────────────────────────────
 
@@ -752,7 +755,6 @@ class Sift(Adw.Application):
     def _build_dashboard(self) -> Gtk.Widget:
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
 
-        # Two-tab view stack (Liked / Trashed)
         self._dash_stack = Adw.ViewStack()
         self._liked_lb   = self._song_listbox()
         self._trash_lb   = self._song_listbox()
@@ -767,7 +769,9 @@ class Sift(Adw.Application):
         self._dash_stack.add_titled_with_icon(
             _scroll(self._trash_lb), "trash", "Trashed", "user-trash-symbolic")
 
-        # Full-width tab switcher in the header (follows GNOME HIG)
+        # Clear selection when switching tabs
+        self._dash_stack.connect("notify::visible-child", self._on_dash_tab_changed)
+
         switcher = Adw.ViewSwitcher()
         switcher.set_stack(self._dash_stack)
         switcher.set_policy(Adw.ViewSwitcherPolicy.WIDE)
@@ -782,7 +786,136 @@ class Sift(Adw.Application):
 
         root.append(hdr)
         root.append(self._dash_stack)
+
+        # Bottom action bar — hidden until something is selected
+        self._dash_action_bar = Gtk.ActionBar()
+
+        select_all_btn = Gtk.Button(label="Select All")
+        select_all_btn.add_css_class("flat")
+        select_all_btn.connect("clicked", lambda _: self._dash_select_all())
+        self._dash_action_bar.pack_start(select_all_btn)
+
+        self._dash_selection_label = Gtk.Label(label="")
+        self._dash_selection_label.add_css_class("caption")
+        self._dash_action_bar.set_center_widget(self._dash_selection_label)
+
+        self._dash_delete_btn = Gtk.Button(label="Move to Trash")
+        self._dash_delete_btn.add_css_class("destructive-action")
+        self._dash_delete_btn.add_css_class("pill")
+        self._dash_delete_btn.connect("clicked", lambda _: self._dash_bulk_delete())
+
+        self._dash_restore_btn = Gtk.Button(label="Restore to Queue")
+        self._dash_restore_btn.add_css_class("pill")
+        self._dash_restore_btn.connect("clicked", lambda _: self._dash_bulk_restore())
+
+        self._dash_action_bar.pack_end(self._dash_delete_btn)
+        self._dash_action_bar.pack_end(self._dash_restore_btn)
+        self._dash_action_bar.set_revealed(False)
+
+        root.append(self._dash_action_bar)
         return root
+    
+    def _current_dash_kind(self) -> str:
+        """Return which tab is currently visible — 'liked' or 'trash'."""
+        name = self._dash_stack.get_visible_child_name()
+        return name if name in ("liked", "trash") else "liked"
+
+    def _on_dash_tab_changed(self, _stack, _param):
+        """Clear selection when the user switches tabs."""
+        self._dash_selection["liked"].clear()
+        self._dash_selection["trash"].clear()
+        self._update_dash_action_bar()
+        self._refresh_dash()
+
+    def _dash_toggle(self, checkbox: Gtk.CheckButton, path: str, kind: str):
+        """Called when a row checkbox is toggled."""
+        if checkbox.get_active():
+            self._dash_selection[kind].add(path)
+        else:
+            self._dash_selection[kind].discard(path)
+        self._update_dash_action_bar()
+
+    def _dash_select_all(self):
+        """Select all visible rows in the current tab."""
+        kind = self._current_dash_kind()
+        source = self.liked if kind == "liked" else self.trash
+        self._dash_selection[kind] = set(source)
+        self._update_dash_action_bar()
+        self._refresh_dash()
+
+    def _update_dash_action_bar(self):
+        """Show or hide the action bar based on current selection count."""
+        kind  = self._current_dash_kind()
+        count = len(self._dash_selection[kind])
+        self._dash_action_bar.set_revealed(count > 0)
+        self._dash_selection_label.set_text(
+            f"{count} song{'s' if count != 1 else ''} selected")
+        # Restore button only makes sense on the trash tab
+        self._dash_restore_btn.set_visible(kind == "trash")
+        # Un-like button only makes sense on the liked tab
+        self._dash_delete_btn.set_label(
+            "Move to Trash" if kind in ("liked", "trash") else "Move to Trash")
+
+    def _dash_bulk_delete(self):
+        """Confirm then send all selected songs to system trash."""
+        kind  = self._current_dash_kind()
+        paths = list(self._dash_selection[kind])
+        if not paths:
+            return
+        names = "\n".join(os.path.basename(p) for p in paths[:5])
+        if len(paths) > 5:
+            names += f"\n… and {len(paths) - 5} more"
+        dlg = Adw.AlertDialog(
+            heading=f"Move {len(paths)} file{'s' if len(paths) != 1 else ''} to trash?",
+            body=names,
+        )
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("delete", "Move to Trash")
+        dlg.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+        dlg.connect("response", lambda d, r, p=paths, k=kind: self._dash_bulk_delete_confirmed(d, r, p, k))
+        dlg.present(self.win)
+
+    def _dash_bulk_delete_confirmed(self, _d, resp: str, paths: list, kind: str):
+        if resp != "delete":
+            return
+        failed = []
+        for path in paths:
+            try:
+                send2trash(path)
+                s = self.liked if kind == "liked" else self.trash
+                f = self._liked_file if kind == "liked" else self._trash_file
+                s.discard(path)
+                save_set(f, s)
+                if path in self.queue:
+                    i = self.queue.index(path)
+                    self.queue.remove(path)
+                    if i < self.idx:
+                        self.idx = max(0, self.idx - 1)
+            except Exception as e:
+                print(f"[bulk delete] {path}: {e}")
+                failed.append(path)
+        self._dash_selection[kind].clear()
+        self._refresh_dash()
+        self._update_dash_action_bar()
+        count = len(paths) - len(failed)
+        self._toast(f"{count} file{'s' if count != 1 else ''} moved to trash")
+
+    def _dash_bulk_restore(self):
+        """Restore all selected trashed songs back to the judging queue."""
+        paths = list(self._dash_selection["trash"])
+        if not paths:
+            return
+        for path in paths:
+            self.trash.discard(path)
+            if os.path.exists(path) and path not in self.queue:
+                self.queue.insert(self.idx, path)
+        save_set(self._trash_file, self.trash)
+        self._dash_selection["trash"].clear()
+        self._refresh_dash()
+        self._update_dash_action_bar()
+        self._toast(f"{len(paths)} song{'s' if len(paths) != 1 else ''} restored to queue")
 
     def _song_listbox(self) -> Gtk.ListBox:
         lb = Gtk.ListBox()
@@ -817,7 +950,7 @@ class Sift(Adw.Application):
             lb.append(self._song_row(p, kind))
 
     def _song_row(self, path: str, kind: str) -> Gtk.Widget:
-        """Build a single dashboard row with restore / un-like and delete buttons."""
+        """Build a single dashboard row with checkbox, restore/un-like, and delete buttons."""
         title, artist, _ = read_tags(path)
         exists = os.path.exists(path)
 
@@ -826,6 +959,14 @@ class Sift(Adw.Application):
         row.set_subtitle(GLib.markup_escape_text(artist or os.path.basename(path)))
         if not exists:
             row.set_sensitive(False)
+
+        # Checkbox on the left
+        check = Gtk.CheckButton()
+        check.set_active(path in self._dash_selection[kind])
+        check.set_valign(Gtk.Align.CENTER)
+        check.connect("toggled", lambda cb, p=path, k=kind: self._dash_toggle(cb, p, k))
+        row.add_prefix(check)
+        row.set_activatable_widget(check)
 
         bbox = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL,
@@ -1166,7 +1307,7 @@ class Sift(Adw.Application):
             application_name="Sift",
             application_icon="io.github.IdleEndeavor.Sift",
             developer_name="IdleEndeavor",
-            version="1.0.0",
+            version="1.2.0",
             comments="Tinder for Your Music Library",
             website="https://github.com/IdleEndeavor/sift_music_sorter",
             issue_url="https://github.com/IdleEndeavor/sift_music_sorter/issues",
