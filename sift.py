@@ -576,8 +576,10 @@ class Sift(Adw.Application):
     # ── App startup ───────────────────────────────────────────────────────────
 
     def do_activate(self):
-        icon_theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
-        icon_theme.add_search_path(os.path.dirname(os.path.abspath(__file__)))
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        if os.path.exists(os.path.join(script_dir, "sift.svg")):
+            icon_theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+            icon_theme.add_search_path(script_dir)
 
         self.win = Adw.ApplicationWindow(application=self)
         self.win.set_default_size(700, 850)
