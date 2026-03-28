@@ -12,7 +12,7 @@
     "--socket=wayland",
     "--socket=pulseaudio",
     "--device=dri",
-    "--filesystem=xdg-music",
+    "--filesystem=home",
     "--filesystem=xdg-config/sift:create"
   ],
   "modules": [
@@ -450,8 +450,8 @@
         {
           "type": "git",
           "url": "https://github.com/IdleEndeavor/sift_music_sorter",
-          "tag": "v1.3.0",
-          "commit": "f45b97b5bb162f509e4f6910993991b4fd806f98" 
+          "tag": "v1.3.1",
+          "commit": "036d965e885a6f2f1458c457c03e75ba05a4a680"
         }
       ]
     }
