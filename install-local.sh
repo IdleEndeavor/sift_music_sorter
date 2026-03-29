@@ -16,12 +16,11 @@ mkdir -p "$ICON_DIR/scalable/apps"
 mkdir -p "$ICON_DIR/symbolic/apps"
 cp "$SCRIPT_DIR/sift.svg"          "$ICON_DIR/scalable/apps/io.github.IdleEndeavor.Sift.svg"
 cp "$SCRIPT_DIR/sift-symbolic.svg" "$ICON_DIR/symbolic/apps/io.github.IdleEndeavor.Sift-symbolic.svg"
-gtk-update-icon-cache "$ICON_DIR" 2>/dev/null || true
+gtk-update-icon-cache -f -t "$ICON_DIR" 2>/dev/null || true
 
 echo "Installing desktop entry..."
 mkdir -p "$APP_DIR"
 
-# Write a desktop file pointing at the actual script location
 cat > "$APP_DIR/io.github.IdleEndeavor.Sift.desktop" <<EOF
 [Desktop Entry]
 Name=Sift
@@ -29,7 +28,7 @@ Comment=Tinder for Your Music Library
 Exec=python3 $SCRIPT_DIR/sift.py
 Icon=io.github.IdleEndeavor.Sift
 Type=Application
-Categories=Audio;Music;GTK;
+Categories=AudioVideo;Audio;Music;GTK;
 Keywords=music;library;sort;tinder;
 StartupWMClass=sift
 EOF
