@@ -924,6 +924,11 @@ class Sift(Adw.Application):
         hdr.pack_start(back)
         hdr.set_title_widget(switcher)
 
+        relocate_btn = Gtk.Button(icon_name="folder-symbolic")
+        relocate_btn.set_tooltip_text("Relocate missing files by scanning a folder")
+        relocate_btn.connect("clicked", lambda _: self._relocate_mass())
+        hdr.pack_end(relocate_btn)
+
         root.append(hdr)
         root.append(self._dash_stack)
 
@@ -934,6 +939,13 @@ class Sift(Adw.Application):
         select_all_btn.add_css_class("flat")
         select_all_btn.connect("clicked", lambda _: self._dash_select_all())
         self._dash_action_bar.pack_start(select_all_btn)
+
+        # Remove all missing entries from the current tab in one go
+        remove_missing_btn = Gtk.Button(label="Remove Missing")
+        remove_missing_btn.add_css_class("flat")
+        remove_missing_btn.connect("clicked", lambda _: self._dash_remove_all_missing())
+        self._dash_action_bar.pack_start(remove_missing_btn)
+        self._dash_remove_missing_btn = remove_missing_btn
 
         self._dash_selection_label = Gtk.Label(label="")
         self._dash_selection_label.add_css_class("caption")
@@ -955,6 +967,22 @@ class Sift(Adw.Application):
         root.append(self._dash_action_bar)
         return root
 
+    def _dash_remove_all_missing(self):
+        """Remove all missing file entries from the current tab."""
+        kind   = self._current_dash_kind()
+        source = self.liked if kind == "liked" else self.trash
+        fpath  = self._liked_file if kind == "liked" else self._trash_file
+        missing = [p for p in source if not os.path.exists(p)]
+        if not missing:
+            self._toast("No missing entries to remove")
+            return
+        for p in missing:
+            source.discard(p)
+        save_set(fpath, source)
+        self._dash_selection[kind] -= set(missing)
+        self._refresh_dash()
+        self._update_dash_action_bar()
+        self._toast(f"Removed {len(missing)} missing entr{'ies' if len(missing) != 1 else 'y'}")
 
     # ── Statistics page ───────────────────────────────────────────────────────
 
@@ -1101,6 +1129,11 @@ class Sift(Adw.Application):
         if self._dash_stack.get_visible_child_name() == "stats":
             self._dash_action_bar.set_revealed(False)
             return
+        # Show remove missing button only when there are missing entries
+        kind = self._current_dash_kind()
+        source = self.liked if kind == "liked" else self.trash
+        has_missing = any(not os.path.exists(p) for p in source)
+        self._dash_remove_missing_btn.set_visible(has_missing)
         kind  = self._current_dash_kind()
         count = len(self._dash_selection[kind])
         self._dash_action_bar.set_revealed(count > 0)
@@ -1189,8 +1222,14 @@ class Sift(Adw.Application):
         self.stack.set_visible_child_name(target)
 
     def _refresh_dash(self):
-        self._fill_lb(self._liked_lb, sorted(self.liked), "liked")
-        self._fill_lb(self._trash_lb, sorted(self.trash),  "trash")
+        def _sorted_missing_first(paths: set) -> list:
+            # Missing files float to the top, then alphabetical within each group
+            missing   = sorted(p for p in paths if not os.path.exists(p))
+            present   = sorted(p for p in paths if os.path.exists(p))
+            return missing + present
+
+        self._fill_lb(self._liked_lb, _sorted_missing_first(self.liked), "liked")
+        self._fill_lb(self._trash_lb, _sorted_missing_first(self.trash),  "trash")
 
     def _fill_lb(self, lb: Gtk.ListBox, paths: list, kind: str):
         while (r := lb.get_row_at_index(0)) is not None:
@@ -1208,15 +1247,16 @@ class Sift(Adw.Application):
         row = Adw.ActionRow()
         row.set_title(GLib.markup_escape_text(title if exists else f"[Missing] {title}"))
         row.set_subtitle(GLib.markup_escape_text(artist or os.path.basename(path)))
-        if not exists:
-            row.set_sensitive(False)
+
+        # Make row clickable to open metadata
+        row.set_activatable(True)
+        row.connect("activated", lambda _r, p=path: self._show_dash_info(p))
 
         check = Gtk.CheckButton()
         check.set_active(path in self._dash_selection[kind])
         check.set_valign(Gtk.Align.CENTER)
         check.connect("toggled", lambda cb, p=path, k=kind: self._dash_toggle(cb, p, k))
         row.add_prefix(check)
-        row.set_activatable_widget(check)
 
         bbox = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL,
@@ -1224,20 +1264,36 @@ class Sift(Adw.Application):
             valign=Gtk.Align.CENTER,
         )
 
-        if kind == "trash":
-            b = Gtk.Button(label="Judge Later")
-            b.add_css_class("pill")
-            b.set_tooltip_text("Restore to judging queue")
-            b.connect("clicked", lambda _b, p=path: self._rescue(p))
-            bbox.append(b)
-        else:
-            b = Gtk.Button(label="Un-like")
-            b.add_css_class("pill")
-            b.set_tooltip_text("Remove from liked, back to queue")
-            b.connect("clicked", lambda _b, p=path: self._unlike(p))
-            bbox.append(b)
+        if not exists:
+            # Missing file — show relocate and remove buttons
+            relocate_btn = Gtk.Button(icon_name="folder-symbolic")
+            relocate_btn.add_css_class("circular")
+            relocate_btn.set_tooltip_text("Point to new location")
+            relocate_btn.connect("clicked",
+                lambda _b, p=path, k=kind: self._relocate_single(p, k))
+            bbox.append(relocate_btn)
 
-        if exists:
+            remove_btn = Gtk.Button(icon_name="list-remove-symbolic")
+            remove_btn.add_css_class("circular")
+            remove_btn.set_tooltip_text("Remove from list")
+            remove_btn.connect("clicked",
+                lambda _b, p=path, k=kind: self._remove_missing(p, k))
+            bbox.append(remove_btn)
+        else:
+            # Existing file — show normal action buttons
+            if kind == "trash":
+                b = Gtk.Button(label="Judge Later")
+                b.add_css_class("pill")
+                b.set_tooltip_text("Restore to judging queue")
+                b.connect("clicked", lambda _b, p=path: self._rescue(p))
+                bbox.append(b)
+            else:
+                b = Gtk.Button(label="Un-like")
+                b.add_css_class("pill")
+                b.set_tooltip_text("Remove from liked, back to queue")
+                b.connect("clicked", lambda _b, p=path: self._unlike(p))
+                bbox.append(b)
+
             d = Gtk.Button(icon_name="user-trash-full-symbolic")
             d.add_css_class("destructive-action")
             d.add_css_class("circular")
@@ -1299,6 +1355,337 @@ class Sift(Adw.Application):
         self._refresh_dash()
         self._toast("File moved to system trash")
 
+    def _show_dash_info(self, path: str):
+        """Show metadata dialog for a dashboard song (works for missing files too)."""
+        exists = os.path.exists(path)
+        try:
+            audio = MutagenFile(path, easy=False)
+            easy  = MutagenFile(path, easy=True)
+        except Exception:
+            audio = easy = None
+
+        def tag(*keys):
+            return _tag(easy, *keys) or "—"
+
+        def fmt_size(p):
+            try:
+                b = os.path.getsize(p)
+                for unit in ("B", "KB", "MB", "GB"):
+                    if b < 1024:
+                        return f"{b:.1f} {unit}"
+                    b /= 1024
+            except Exception:
+                return "—" if exists else "File not found"
+
+        def fmt_bitrate():
+            try:
+                return f"{int(audio.info.bitrate / 1000)} kbps"
+            except Exception:
+                return "—"
+
+        def fmt_samplerate():
+            try:
+                return f"{audio.info.sample_rate / 1000:.1f} kHz"
+            except Exception:
+                return "—"
+
+        def fmt_duration():
+            try:
+                s = int(audio.info.length)
+                return f"{s // 60}:{s % 60:02d}"
+            except Exception:
+                return "—"
+
+        def fmt_channels():
+            try:
+                return "Stereo" if audio.info.channels == 2 else str(audio.info.channels)
+            except Exception:
+                return "—"
+
+        rows = [
+            ("Status",       "Available" if exists else "⚠ File missing"),
+            ("Title",        tag("title")),
+            ("Artist",       tag("artist")),
+            ("Album",        tag("album")),
+            ("Album Artist", tag("albumartist", "album artist")),
+            ("Track",        tag("tracknumber")),
+            ("Date",         tag("date", "year")),
+            ("Genre",        tag("genre")),
+            ("Composer",     tag("composer")),
+            ("Comment",      tag("comment")),
+            ("Duration",     fmt_duration()),
+            ("Bitrate",      fmt_bitrate()),
+            ("Sample Rate",  fmt_samplerate()),
+            ("Channels",     fmt_channels()),
+            ("File Size",    fmt_size(path)),
+            ("Format",       os.path.splitext(path)[1].lstrip(".").upper()),
+            ("Path",         path),
+        ]
+
+        grid = Gtk.Grid()
+        grid.set_column_spacing(24)
+        grid.set_row_spacing(8)
+        grid.set_margin_top(12)
+        grid.set_margin_bottom(12)
+        grid.set_margin_start(16)
+        grid.set_margin_end(16)
+
+        for i, (label, value) in enumerate(rows):
+            key_lbl = Gtk.Label(label=label)
+            key_lbl.set_halign(Gtk.Align.START)
+            key_lbl.set_valign(Gtk.Align.START)
+            key_lbl.add_css_class("caption-heading")
+            key_lbl.set_opacity(0.55)
+
+            val_lbl = Gtk.Label(label=value)
+            val_lbl.set_use_markup(False)
+            val_lbl.set_halign(Gtk.Align.START)
+            val_lbl.set_valign(Gtk.Align.START)
+            val_lbl.set_selectable(True)
+            val_lbl.set_wrap(True)
+            val_lbl.set_xalign(0)
+            val_lbl.add_css_class("body")
+            if label == "Status" and not exists:
+                val_lbl.add_css_class("error")
+
+            grid.attach(key_lbl, 0, i, 1, 1)
+            grid.attach(val_lbl, 1, i, 1, 1)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_min_content_height(300)
+        scroll.set_max_content_height(500)
+        scroll.set_propagate_natural_height(True)
+        scroll.set_child(grid)
+
+        dlg = Adw.Dialog()
+        dlg.set_title("Song Info")
+        dlg.set_content_width(420)
+
+        toolbar_view = Adw.ToolbarView()
+        sub_hdr = Adw.HeaderBar()
+        sub_hdr.add_css_class("flat")
+        toolbar_view.add_top_bar(sub_hdr)
+        toolbar_view.set_content(scroll)
+        dlg.set_child(toolbar_view)
+        dlg.present(self.win)
+
+    def _remove_missing(self, path: str, kind: str):
+        """Silently remove a missing file entry from the liked or trash list."""
+        s = self.liked if kind == "liked" else self.trash
+        f = self._liked_file if kind == "liked" else self._trash_file
+        s.discard(path)
+        save_set(f, s)
+        self._refresh_dash()
+        self._toast("Removed missing entry")
+
+    def _relocate_single(self, old_path: str, kind: str):
+        """Open a file picker to point a missing entry to its new location."""
+        dialog = Gtk.FileDialog.new()
+        dialog.set_title("Find new location for file")
+        dialog.open(self.win, None,
+            lambda d, r, op=old_path, k=kind: self._relocate_single_chosen(d, r, op, k))
+
+    def _relocate_single_chosen(self, dialog, result, old_path: str, kind: str):
+        try:
+            f = dialog.open_finish(result)
+        except GLib.Error:
+            return
+        if not f:
+            return
+        new_path = f.get_path()
+        s = self.liked if kind == "liked" else self.trash
+        fl = self._liked_file if kind == "liked" else self._trash_file
+        s.discard(old_path)
+        s.add(new_path)
+        save_set(fl, s)
+        # Update queue if old path was in it
+        if old_path in self.queue:
+            i = self.queue.index(old_path)
+            self.queue[i] = new_path
+        self._refresh_dash()
+        self._toast(f"Relocated to {os.path.basename(new_path)}")
+
+    def _relocate_mass(self):
+        """Open a folder picker then scan for files matching missing entries."""
+        dialog = Gtk.FileDialog.new()
+        dialog.set_title("Scan folder to relocate missing files")
+        dialog.select_folder(self.win, None, self._relocate_mass_chosen)
+
+    def _relocate_mass_chosen(self, dialog, result):
+        try:
+            folder = dialog.select_folder_finish(result)
+        except GLib.Error:
+            return
+        if not folder:
+            return
+        scan_root = folder.get_path()
+
+        # Collect all missing paths from both lists
+        all_missing = {
+            p: "liked" for p in self.liked if not os.path.exists(p)
+        }
+        all_missing.update({
+            p: "trash" for p in self.trash if not os.path.exists(p)
+        })
+
+        if not all_missing:
+            self._toast("No missing files to relocate")
+            return
+
+        # Index all audio files in the scanned folder by filename
+        exts = (".flac", ".mp3", ".wav", ".ogg", ".m4a", ".opus")
+        scan_index: dict[str, str] = {}  # filename → full path
+        for root, _, names in os.walk(scan_root):
+            for name in names:
+                if name.lower().endswith(exts):
+                    scan_index[name.lower()] = os.path.join(root, name)
+
+        # Match missing files — exact filename first, then fuzzy title+artist
+        CONFIDENCE_THRESHOLD = 0.85
+        matches: list[tuple[str, str, str, float]] = []  # old, new, kind, confidence
+
+        for old_path, kind in all_missing.items():
+            old_name = os.path.basename(old_path).lower()
+
+            # Exact filename match — confidence 1.0
+            if old_name in scan_index:
+                matches.append((old_path, scan_index[old_name], kind, 1.0))
+                continue
+
+            # Fuzzy match — compare title+artist tags
+            try:
+                old_f   = MutagenFile(old_path, easy=True)
+                old_title  = _tag(old_f, "title").lower().strip()
+                old_artist = _tag(old_f, "artist").lower().strip()
+            except Exception:
+                old_title = os.path.splitext(os.path.basename(old_path))[0].lower()
+                old_artist = ""
+
+            best_score = 0.0
+            best_path  = None
+            for cand_name, cand_path in scan_index.items():
+                try:
+                    cand_f      = MutagenFile(cand_path, easy=True)
+                    cand_title  = _tag(cand_f, "title").lower().strip()
+                    cand_artist = _tag(cand_f, "artist").lower().strip()
+                except Exception:
+                    cand_title  = os.path.splitext(cand_name)[0].lower()
+                    cand_artist = ""
+
+                # Simple similarity: proportion of matching characters
+                def _sim(a: str, b: str) -> float:
+                    if not a or not b:
+                        return 0.0
+                    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+                    matches_count = sum(1 for c in shorter if c in longer)
+                    return matches_count / max(len(longer), 1)
+
+                title_score  = _sim(old_title,  cand_title)
+                artist_score = _sim(old_artist, cand_artist) if old_artist else title_score
+                score = (title_score * 0.6) + (artist_score * 0.4)
+
+                if score > best_score:
+                    best_score = score
+                    best_path  = cand_path
+
+            if best_path and best_score >= CONFIDENCE_THRESHOLD:
+                matches.append((old_path, best_path, kind, best_score))
+
+        if not matches:
+            self._toast("No matches found above confidence threshold")
+            return
+
+        self._show_relocate_review(matches)
+
+    def _show_relocate_review(self, matches: list):
+        """Show a review dialog listing proposed old→new path matches."""
+        dlg = Adw.Dialog()
+        dlg.set_title(f"Relocate {len(matches)} file{'s' if len(matches) != 1 else ''}")
+        dlg.set_content_width(560)
+
+        toolbar_view = Adw.ToolbarView()
+        sub_hdr = Adw.HeaderBar()
+        sub_hdr.add_css_class("flat")
+        toolbar_view.add_top_bar(sub_hdr)
+
+        # Scrollable list of matches
+        lb = Gtk.ListBox()
+        lb.set_selection_mode(Gtk.SelectionMode.NONE)
+        lb.add_css_class("boxed-list")
+        lb.set_margin_top(8)
+        lb.set_margin_bottom(8)
+        lb.set_margin_start(12)
+        lb.set_margin_end(12)
+
+        # Track which matches are checked
+        checks: list[tuple[Gtk.CheckButton, str, str, str]] = []
+
+        for old_path, new_path, kind, confidence in matches:
+            row = Adw.ActionRow()
+            row.set_title(GLib.markup_escape_text(os.path.basename(new_path)))
+            row.set_subtitle(
+                GLib.markup_escape_text(
+                    f"{os.path.basename(old_path)}  →  {os.path.dirname(new_path)}"
+                )
+            )
+
+            check = Gtk.CheckButton()
+            check.set_active(True)
+            check.set_valign(Gtk.Align.CENTER)
+            row.add_prefix(check)
+            checks.append((check, old_path, new_path, kind))
+
+            conf_lbl = Gtk.Label(label=f"{confidence:.0%}")
+            conf_lbl.add_css_class("caption")
+            conf_lbl.set_opacity(0.55)
+            conf_lbl.set_valign(Gtk.Align.CENTER)
+            row.add_suffix(conf_lbl)
+
+            lb.append(row)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_min_content_height(200)
+        scroll.set_max_content_height(480)
+        scroll.set_propagate_natural_height(True)
+        scroll.set_child(lb)
+
+        # Apply button at bottom
+        apply_btn = Gtk.Button(label="Apply Selected")
+        apply_btn.add_css_class("suggested-action")
+        apply_btn.add_css_class("pill")
+        apply_btn.set_margin_top(12)
+        apply_btn.set_margin_bottom(16)
+        apply_btn.set_margin_start(12)
+        apply_btn.set_margin_end(12)
+        apply_btn.set_halign(Gtk.Align.CENTER)
+
+        def _apply(_btn):
+            count = 0
+            for check, old_path, new_path, kind in checks:
+                if not check.get_active():
+                    continue
+                s  = self.liked if kind == "liked" else self.trash
+                fl = self._liked_file if kind == "liked" else self._trash_file
+                s.discard(old_path)
+                s.add(new_path)
+                save_set(fl, s)
+                if old_path in self.queue:
+                    i = self.queue.index(old_path)
+                    self.queue[i] = new_path
+                count += 1
+            dlg.close()
+            self._refresh_dash()
+            self._toast(f"Relocated {count} file{'s' if count != 1 else ''}")
+
+        apply_btn.connect("clicked", _apply)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        content.append(scroll)
+        content.append(apply_btn)
+
+        toolbar_view.set_content(content)
+        dlg.set_child(toolbar_view)
+        dlg.present(self.win)
 
     # ── Song info dialog ──────────────────────────────────────────────────────
 
@@ -1550,7 +1937,7 @@ class Sift(Adw.Application):
             application_name="Sift",
             application_icon="io.github.IdleEndeavor.Sift",
             developer_name="IdleEndeavor",
-            version="1.3.0",
+            version="2.0",
             comments="Tinder for Your Music Library",
             website="https://github.com/IdleEndeavor/sift_music_sorter",
             issue_url="https://github.com/IdleEndeavor/sift_music_sorter/issues",
