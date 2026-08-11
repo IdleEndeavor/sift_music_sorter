@@ -13,7 +13,9 @@
     "--socket=pulseaudio",
     "--device=dri",
     "--filesystem=home",
-    "--filesystem=xdg-config/sift:create"
+    "--filesystem=xdg-config/sift:create",
+    "--own-name=org.mpris.MediaPlayer2.sift",
+    "--talk-name=org.freedesktop.DBus"
   ],
   "modules": [
     {
@@ -451,7 +453,7 @@
           "type": "git",
           "url": "https://github.com/IdleEndeavor/sift_music_sorter",
           "tag": "v2.0.0",
-	  "commit": "a7ecb89eab08e44cdaa7bbde3a9dfc6079c5c4f6"
+          "commit": "a7ecb89eab08e44cdaa7bbde3a9dfc6079c5c4f6"
         }
       ]
     }

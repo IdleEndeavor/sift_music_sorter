@@ -69,6 +69,69 @@ _DEFAULT_WORKSPACE = os.path.join(
 atexit.register(lambda: shutil.rmtree(CLIP_DIR, ignore_errors=True))
 
 
+# ── MPRIS D-Bus interface XML ─────────────────────────────────────────────────
+
+_MPRIS_NODE_XML = """\
+<node>
+  <interface name="org.mpris.MediaPlayer2">
+    <method name="Raise"/>
+    <method name="Quit"/>
+    <property name="CanQuit"             type="b"  access="read"/>
+    <property name="CanRaise"            type="b"  access="read"/>
+    <property name="HasTrackList"        type="b"  access="read"/>
+    <property name="Identity"            type="s"  access="read"/>
+    <property name="SupportedUriSchemes" type="as" access="read"/>
+    <property name="SupportedMimeTypes"  type="as" access="read"/>
+  </interface>
+  <interface name="org.mpris.MediaPlayer2.Player">
+    <method name="Next"/>
+    <method name="Previous"/>
+    <method name="Pause"/>
+    <method name="PlayPause"/>
+    <method name="Stop"/>
+    <method name="Play"/>
+    <method name="Seek">
+      <arg direction="in" type="x" name="Offset"/>
+    </method>
+    <method name="SetPosition">
+      <arg direction="in" type="o" name="TrackId"/>
+      <arg direction="in" type="x" name="Position"/>
+    </method>
+    <method name="OpenUri">
+      <arg direction="in" type="s" name="Uri"/>
+    </method>
+    <signal name="Seeked">
+      <arg type="x" name="Position"/>
+    </signal>
+    <property name="PlaybackStatus" type="s"    access="read"/>
+    <property name="LoopStatus"     type="s"    access="readwrite"/>
+    <property name="Rate"           type="d"    access="readwrite"/>
+    <property name="Shuffle"        type="b"    access="readwrite"/>
+    <property name="Metadata"       type="a{sv}" access="read"/>
+    <property name="Volume"         type="d"    access="readwrite"/>
+    <property name="Position"       type="x"    access="read"/>
+    <property name="MinimumRate"    type="d"    access="read"/>
+    <property name="MaximumRate"    type="d"    access="read"/>
+    <property name="CanGoNext"      type="b"    access="read"/>
+    <property name="CanGoPrevious"  type="b"    access="read"/>
+    <property name="CanPlay"        type="b"    access="read"/>
+    <property name="CanPause"       type="b"    access="read"/>
+    <property name="CanSeek"        type="b"    access="read"/>
+    <property name="CanControl"     type="b"    access="read"/>
+  </interface>
+</node>
+"""
+
+# ── String similarity helper ──────────────────────────────────────────────────
+
+def _str_sim(a: str, b: str) -> float:
+    """Simple character-overlap similarity in [0, 1]."""
+    if not a or not b:
+        return 0.0
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    return sum(1 for c in shorter if c in longer) / max(len(longer), 1)
+
+
 # ── App config helpers ────────────────────────────────────────────────────────
 
 def load_config() -> dict:
@@ -413,6 +476,17 @@ class Sift(Adw.Application):
             flags=Gio.ApplicationFlags.FLAGS_NONE,
         )
         self.player = Gst.ElementFactory.make("playbin", "player")
+        _bus = self.player.get_bus()
+        _bus.add_signal_watch()
+        _bus.connect("message", self._on_gst_message)
+
+        self._mpris_conn:     object     = None
+        self._mpris_reg_ids:  list[int] = []
+        self._mpris_owner_id: int       = 0
+        self._mpris_node:     object    = None
+        self._mpris_status:   str       = "Stopped"
+        self._mpris_meta:     dict      = {}
+        self._dash_gen:       int       = 0
 
         self.queue:   list[str]                               = []
         self.cache:   dict[str, tuple[float, str | None, str]] = {}
@@ -602,6 +676,8 @@ class Sift(Adw.Application):
         self.toast_overlay.set_child(self.stack)
         self.win.set_content(self.toast_overlay)
 
+        self._mpris_setup()
+
         if self._saved_dir and os.path.isdir(self._saved_dir):
             self.music_dir = self._saved_dir
             self._index_library(resume_idx=self._saved_idx)
@@ -628,6 +704,14 @@ class Sift(Adw.Application):
     def _on_screen_changed(self, _stack, _param):
         if self.stack.get_visible_child_name() == "player":
             self.play_btn.grab_focus()
+
+    def _on_gst_message(self, _bus, message):
+        if message.type == Gst.MessageType.EOS:
+            GLib.idle_add(lambda: self._action("skip") or False)
+        elif message.type == Gst.MessageType.ERROR:
+            err, _ = message.parse_error()
+            print(f"[gst error] {err}")
+            GLib.idle_add(lambda: self._action("skip") or False)
 
 
     # ── Setup screen ──────────────────────────────────────────────────────────
@@ -724,6 +808,7 @@ class Sift(Adw.Application):
             ("←  Trash", "Mark the song for removal"),
             ("↓  Skip",  "Skip without deciding"),
             ("Space",    "Play / pause"),
+            ("Ctrl+Z",   "Undo last action"),
         ]:
             row = Adw.ActionRow(title=key, subtitle=desc)
             row.set_use_markup(False)
@@ -1007,7 +1092,7 @@ class Sift(Adw.Application):
         liked_size       = sum(_file_size_bytes(p) for p in self.liked if os.path.exists(p))
         trash_on_disk    = [p for p in self.trash if os.path.exists(p)]
         trash_on_disk_sz = sum(_file_size_bytes(p) for p in trash_on_disk)
-        deleted_count = sum(r.get("count", 1) for r in deleted)
+        deleted_count = len(deleted)
         deleted_size     = sum(r.get("size", 0) for r in deleted)
 
         # Combined artist / genre counts
@@ -1214,35 +1299,56 @@ class Sift(Adw.Application):
         return lb
 
     def _open_dashboard(self):
-        self._refresh_dash()
         self.stack.set_visible_child_name("dashboard")
+        name = self._dash_stack.get_visible_child_name()
+        if name == "stats":
+            self._refresh_stats()
+        else:
+            self._refresh_dash()
 
     def _dash_back(self, _btn):
         target = "player" if (self.queue or self.idx > 0) else "setup"
         self.stack.set_visible_child_name(target)
 
     def _refresh_dash(self):
-        def _sorted_missing_first(paths: set) -> list:
-            # Missing files float to the top, then alphabetical within each group
-            missing   = sorted(p for p in paths if not os.path.exists(p))
-            present   = sorted(p for p in paths if os.path.exists(p))
-            return missing + present
+        self._dash_gen += 1
+        gen = self._dash_gen
+        liked_snap = set(self.liked)
+        trash_snap = set(self.trash)
 
-        self._fill_lb(self._liked_lb, _sorted_missing_first(self.liked), "liked")
-        self._fill_lb(self._trash_lb, _sorted_missing_first(self.trash),  "trash")
+        def _bg():
+            def _sorted_mf(paths):
+                missing = sorted(p for p in paths if not os.path.exists(p))
+                present = sorted(p for p in paths if os.path.exists(p))
+                return missing + present
 
-    def _fill_lb(self, lb: Gtk.ListBox, paths: list, kind: str):
+            def _info(path):
+                title, artist, _ = read_tags(path)
+                return path, title, artist, os.path.exists(path)
+
+            liked_data = [_info(p) for p in _sorted_mf(liked_snap)]
+            trash_data = [_info(p) for p in _sorted_mf(trash_snap)]
+            GLib.idle_add(lambda: self._apply_dash(gen, liked_data, trash_data) or False)
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _apply_dash(self, gen: int, liked_data: list, trash_data: list):
+        if gen != self._dash_gen:
+            return
+        self._fill_lb(self._liked_lb, liked_data, "liked")
+        self._fill_lb(self._trash_lb, trash_data, "trash")
+
+    def _fill_lb(self, lb: Gtk.ListBox, rows: list, kind: str):
         while (r := lb.get_row_at_index(0)) is not None:
             lb.remove(r)
-        if not paths:
+        if not rows:
             lb.append(Adw.ActionRow(title="Nothing here yet."))
             return
-        for p in paths:
-            lb.append(self._song_row(p, kind))
+        for item in rows:
+            lb.append(self._song_row(*item, kind))
 
-    def _song_row(self, path: str, kind: str) -> Gtk.Widget:
-        title, artist, _ = read_tags(path)
-        exists = os.path.exists(path)
+    def _song_row(self, path: str, title: str, artist: str, exists: bool,
+                  kind: str) -> Gtk.Widget:
 
         row = Adw.ActionRow()
         row.set_title(GLib.markup_escape_text(title if exists else f"[Missing] {title}"))
@@ -1356,118 +1462,10 @@ class Sift(Adw.Application):
         self._toast("File moved to system trash")
 
     def _show_dash_info(self, path: str):
-        """Show metadata dialog for a dashboard song (works for missing files too)."""
         exists = os.path.exists(path)
-        try:
-            audio = MutagenFile(path, easy=False)
-            easy  = MutagenFile(path, easy=True)
-        except Exception:
-            audio = easy = None
-
-        def tag(*keys):
-            return _tag(easy, *keys) or "—"
-
-        def fmt_size(p):
-            try:
-                b = os.path.getsize(p)
-                for unit in ("B", "KB", "MB", "GB"):
-                    if b < 1024:
-                        return f"{b:.1f} {unit}"
-                    b /= 1024
-            except Exception:
-                return "—" if exists else "File not found"
-
-        def fmt_bitrate():
-            try:
-                return f"{int(audio.info.bitrate / 1000)} kbps"
-            except Exception:
-                return "—"
-
-        def fmt_samplerate():
-            try:
-                return f"{audio.info.sample_rate / 1000:.1f} kHz"
-            except Exception:
-                return "—"
-
-        def fmt_duration():
-            try:
-                s = int(audio.info.length)
-                return f"{s // 60}:{s % 60:02d}"
-            except Exception:
-                return "—"
-
-        def fmt_channels():
-            try:
-                return "Stereo" if audio.info.channels == 2 else str(audio.info.channels)
-            except Exception:
-                return "—"
-
-        rows = [
-            ("Status",       "Available" if exists else "⚠ File missing"),
-            ("Title",        tag("title")),
-            ("Artist",       tag("artist")),
-            ("Album",        tag("album")),
-            ("Album Artist", tag("albumartist", "album artist")),
-            ("Track",        tag("tracknumber")),
-            ("Date",         tag("date", "year")),
-            ("Genre",        tag("genre")),
-            ("Composer",     tag("composer")),
-            ("Comment",      tag("comment")),
-            ("Duration",     fmt_duration()),
-            ("Bitrate",      fmt_bitrate()),
-            ("Sample Rate",  fmt_samplerate()),
-            ("Channels",     fmt_channels()),
-            ("File Size",    fmt_size(path)),
-            ("Format",       os.path.splitext(path)[1].lstrip(".").upper()),
-            ("Path",         path),
-        ]
-
-        grid = Gtk.Grid()
-        grid.set_column_spacing(24)
-        grid.set_row_spacing(8)
-        grid.set_margin_top(12)
-        grid.set_margin_bottom(12)
-        grid.set_margin_start(16)
-        grid.set_margin_end(16)
-
-        for i, (label, value) in enumerate(rows):
-            key_lbl = Gtk.Label(label=label)
-            key_lbl.set_halign(Gtk.Align.START)
-            key_lbl.set_valign(Gtk.Align.START)
-            key_lbl.add_css_class("caption-heading")
-            key_lbl.set_opacity(0.55)
-
-            val_lbl = Gtk.Label(label=value)
-            val_lbl.set_use_markup(False)
-            val_lbl.set_halign(Gtk.Align.START)
-            val_lbl.set_valign(Gtk.Align.START)
-            val_lbl.set_selectable(True)
-            val_lbl.set_wrap(True)
-            val_lbl.set_xalign(0)
-            val_lbl.add_css_class("body")
-            if label == "Status" and not exists:
-                val_lbl.add_css_class("error")
-
-            grid.attach(key_lbl, 0, i, 1, 1)
-            grid.attach(val_lbl, 1, i, 1, 1)
-
-        scroll = Gtk.ScrolledWindow()
-        scroll.set_min_content_height(300)
-        scroll.set_max_content_height(500)
-        scroll.set_propagate_natural_height(True)
-        scroll.set_child(grid)
-
-        dlg = Adw.Dialog()
-        dlg.set_title("Song Info")
-        dlg.set_content_width(420)
-
-        toolbar_view = Adw.ToolbarView()
-        sub_hdr = Adw.HeaderBar()
-        sub_hdr.add_css_class("flat")
-        toolbar_view.add_top_bar(sub_hdr)
-        toolbar_view.set_content(scroll)
-        dlg.set_child(toolbar_view)
-        dlg.present(self.win)
+        status_row = ("Status", "Available" if exists else "⚠ File missing")
+        self._make_info_dialog(path, prefix_rows=[status_row],
+                               error_label="Status" if not exists else None)
 
     def _remove_missing(self, path: str, kind: str):
         """Silently remove a missing file entry from the liked or trash list."""
@@ -1572,16 +1570,8 @@ class Sift(Adw.Application):
                     cand_title  = os.path.splitext(cand_name)[0].lower()
                     cand_artist = ""
 
-                # Simple similarity: proportion of matching characters
-                def _sim(a: str, b: str) -> float:
-                    if not a or not b:
-                        return 0.0
-                    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
-                    matches_count = sum(1 for c in shorter if c in longer)
-                    return matches_count / max(len(longer), 1)
-
-                title_score  = _sim(old_title,  cand_title)
-                artist_score = _sim(old_artist, cand_artist) if old_artist else title_score
+                title_score  = _str_sim(old_title,  cand_title)
+                artist_score = _str_sim(old_artist, cand_artist) if old_artist else title_score
                 score = (title_score * 0.6) + (artist_score * 0.4)
 
                 if score > best_score:
@@ -1693,7 +1683,16 @@ class Sift(Adw.Application):
         if self.idx >= len(self.queue):
             return
         path = self.queue[self.idx]
+        self._make_info_dialog(path, suffix_rows=[
+            ("Workspace", self.workspace),
+            ("Mode",      "New Music" if self._new_music_mode else "Judge Library"),
+        ])
 
+    def _make_info_dialog(self, path: str,
+                          prefix_rows: list = (),
+                          suffix_rows: list = (),
+                          error_label: str | None = None):
+        """Build and show a Song Info dialog for any path."""
         try:
             audio = MutagenFile(path, easy=False)
             easy  = MutagenFile(path, easy=True)
@@ -1703,42 +1702,35 @@ class Sift(Adw.Application):
         def tag(*keys):
             return _tag(easy, *keys) or "—"
 
-        def fmt_size(p):
+        def fmt_size():
             try:
-                b = os.path.getsize(p)
+                b = os.path.getsize(path)
                 for unit in ("B", "KB", "MB", "GB"):
                     if b < 1024:
                         return f"{b:.1f} {unit}"
                     b /= 1024
             except Exception:
-                return "—"
+                return "—" if os.path.exists(path) else "File not found"
 
         def fmt_bitrate():
-            try:
-                return f"{int(audio.info.bitrate / 1000)} kbps"
-            except Exception:
-                return "—"
+            try:    return f"{int(audio.info.bitrate / 1000)} kbps"
+            except: return "—"
 
         def fmt_samplerate():
-            try:
-                return f"{audio.info.sample_rate / 1000:.1f} kHz"
-            except Exception:
-                return "—"
+            try:    return f"{audio.info.sample_rate / 1000:.1f} kHz"
+            except: return "—"
 
         def fmt_duration():
             try:
                 s = int(audio.info.length)
                 return f"{s // 60}:{s % 60:02d}"
-            except Exception:
-                return "—"
+            except: return "—"
 
         def fmt_channels():
-            try:
-                return "Stereo" if audio.info.channels == 2 else str(audio.info.channels)
-            except Exception:
-                return "—"
+            try:    return "Stereo" if audio.info.channels == 2 else str(audio.info.channels)
+            except: return "—"
 
-        rows = [
+        rows = list(prefix_rows) + [
             ("Title",        tag("title")),
             ("Artist",       tag("artist")),
             ("Album",        tag("album")),
@@ -1752,12 +1744,10 @@ class Sift(Adw.Application):
             ("Bitrate",      fmt_bitrate()),
             ("Sample Rate",  fmt_samplerate()),
             ("Channels",     fmt_channels()),
-            ("File Size",    fmt_size(path)),
+            ("File Size",    fmt_size()),
             ("Format",       os.path.splitext(path)[1].lstrip(".").upper()),
             ("Path",         path),
-            ("Workspace",    self.workspace),
-            ("Mode",         "New Music" if self._new_music_mode else "Judge Library"),
-        ]
+        ] + list(suffix_rows)
 
         grid = Gtk.Grid()
         grid.set_column_spacing(24)
@@ -1782,6 +1772,8 @@ class Sift(Adw.Application):
             val_lbl.set_wrap(True)
             val_lbl.set_xalign(0)
             val_lbl.add_css_class("body")
+            if error_label and label == error_label:
+                val_lbl.add_css_class("error")
 
             grid.attach(key_lbl, 0, i, 1, 1)
             grid.attach(val_lbl, 1, i, 1, 1)
@@ -1990,7 +1982,7 @@ class Sift(Adw.Application):
 
         def work():
             count = 0
-            for i in range(self.idx, len(self.queue)):
+            for i in range(self.idx, min(self.idx + 50, len(self.queue))):
                 if count >= 10:
                     break
                 path = self.queue[i]
@@ -2067,6 +2059,15 @@ class Sift(Adw.Application):
         self.player.set_property("uri", safe_uri(path))
         self.player.set_state(Gst.State.PLAYING)
         self._set_play_icon(True)
+
+        self._mpris_status = "Playing"
+        self._mpris_meta   = self._mpris_metadata()
+        self._mpris_emit_props({
+            "Metadata":       GLib.Variant("a{sv}", self._mpris_meta),
+            "PlaybackStatus": GLib.Variant("s", "Playing"),
+            "CanGoNext":      GLib.Variant("b", self.idx < len(self.queue)),
+            "CanGoPrevious":  GLib.Variant("b", bool(self.history)),
+        })
 
         if self._new_music_mode:
             # Play from the beginning — no chorus seeking
@@ -2147,6 +2148,10 @@ class Sift(Adw.Application):
         playing = state == Gst.State.PLAYING
         self.player.set_state(Gst.State.PAUSED if playing else Gst.State.PLAYING)
         self._set_play_icon(not playing)
+        self._mpris_status = "Paused" if playing else "Playing"
+        self._mpris_emit_props({
+            "PlaybackStatus": GLib.Variant("s", self._mpris_status),
+        })
 
     def _set_play_icon(self, playing: bool):
         icon = ("media-playback-pause-symbolic" if playing
@@ -2296,6 +2301,185 @@ class Sift(Adw.Application):
     def _fmt(s: float) -> str:
         s = int(s)
         return f"{s // 60}:{s % 60:02d}"
+
+
+    # ── MPRIS2 D-Bus integration ──────────────────────────────────────────────
+
+    def _mpris_setup(self):
+        try:
+            self._mpris_node         = Gio.DBusNodeInfo.new_for_xml(_MPRIS_NODE_XML)
+            self._mpris_iface_root   = self._mpris_node.lookup_interface(
+                "org.mpris.MediaPlayer2")
+            self._mpris_iface_player = self._mpris_node.lookup_interface(
+                "org.mpris.MediaPlayer2.Player")
+
+            def _bus_acquired(conn, _name):
+                self._mpris_conn = conn
+                self._mpris_reg_ids.append(conn.register_object(
+                    "/org/mpris/MediaPlayer2",
+                    self._mpris_iface_root,
+                    self._mpris_method_call,
+                    self._mpris_get_property,
+                    None,
+                ))
+                self._mpris_reg_ids.append(conn.register_object(
+                    "/org/mpris/MediaPlayer2",
+                    self._mpris_iface_player,
+                    self._mpris_method_call,
+                    self._mpris_get_property,
+                    self._mpris_set_property,
+                ))
+
+            self._mpris_owner_id = Gio.bus_own_name(
+                Gio.BusType.SESSION,
+                "org.mpris.MediaPlayer2.sift",
+                Gio.BusNameOwnerFlags.NONE,
+                _bus_acquired,
+                None,
+                None,
+            )
+        except Exception as e:
+            print(f"[mpris] setup failed: {e}")
+
+    def _mpris_method_call(self, conn, _sender, _obj, iface, method, params, invocation):
+        try:
+            if iface == "org.mpris.MediaPlayer2":
+                if method == "Raise":
+                    GLib.idle_add(self.win.present)
+                elif method == "Quit":
+                    GLib.idle_add(self.quit)
+            elif iface == "org.mpris.MediaPlayer2.Player":
+                if method == "Next":
+                    GLib.idle_add(lambda: self._action("skip") or False)
+                elif method == "Previous":
+                    GLib.idle_add(self._undo)
+                elif method in ("Pause", "Stop"):
+                    _, state, _ = self.player.get_state(0)
+                    if state == Gst.State.PLAYING:
+                        GLib.idle_add(self._toggle_play)
+                elif method in ("Play", "PlayPause"):
+                    GLib.idle_add(self._toggle_play)
+                elif method == "Seek":
+                    offset_us = params[0]
+                    ok, pos = self.player.query_position(Gst.Format.TIME)
+                    if ok:
+                        new_pos = max(0, pos + offset_us * 1000)
+                        GLib.idle_add(lambda p=new_pos: self.player.seek_simple(
+                            Gst.Format.TIME,
+                            Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT, p) or False)
+                elif method == "SetPosition":
+                    pos_us = params[1]
+                    GLib.idle_add(lambda p=pos_us: self.player.seek_simple(
+                        Gst.Format.TIME,
+                        Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
+                        p * 1000) or False)
+            invocation.return_value(GLib.Variant("()", ()))
+        except Exception as e:
+            print(f"[mpris] method {method}: {e}")
+            invocation.return_dbus_error("org.mpris.MediaPlayer2.Error", str(e))
+
+    def _mpris_get_property(self, _conn, _sender, _obj, iface, prop):
+        # Called from a D-Bus thread — only use pre-cached values and lightweight queries.
+        try:
+            if iface == "org.mpris.MediaPlayer2":
+                return {
+                    "CanQuit":             GLib.Variant("b", True),
+                    "CanRaise":            GLib.Variant("b", True),
+                    "HasTrackList":        GLib.Variant("b", False),
+                    "Identity":            GLib.Variant("s", "Sift"),
+                    "SupportedUriSchemes": GLib.Variant("as", []),
+                    "SupportedMimeTypes":  GLib.Variant("as", []),
+                }.get(prop)
+            if iface == "org.mpris.MediaPlayer2.Player":
+                ok, pos = self.player.query_position(Gst.Format.TIME)
+                pos_us  = pos // 1000 if ok else 0
+                has_q   = bool(self.queue)
+                return {
+                    "PlaybackStatus": GLib.Variant("s", self._mpris_status),
+                    "LoopStatus":     GLib.Variant("s", "None"),
+                    "Rate":           GLib.Variant("d", 1.0),
+                    "Shuffle":        GLib.Variant("b", False),
+                    "Metadata":       GLib.Variant("a{sv}", self._mpris_meta),
+                    "Volume":         GLib.Variant("d", 1.0),
+                    "Position":       GLib.Variant("x", pos_us),
+                    "MinimumRate":    GLib.Variant("d", 1.0),
+                    "MaximumRate":    GLib.Variant("d", 1.0),
+                    "CanGoNext":      GLib.Variant("b", has_q),
+                    "CanGoPrevious":  GLib.Variant("b", bool(self.history)),
+                    "CanPlay":        GLib.Variant("b", has_q),
+                    "CanPause":       GLib.Variant("b", has_q),
+                    "CanSeek":        GLib.Variant("b", has_q),
+                    "CanControl":     GLib.Variant("b", True),
+                }.get(prop)
+        except Exception as e:
+            print(f"[mpris] get_property {prop}: {e}")
+        return None
+
+    def _mpris_set_property(self, _conn, _sender, _obj, _iface, _prop, _val):
+        return True  # accept but ignore writable props (LoopStatus, Rate, Shuffle, Volume)
+
+    def _mpris_metadata(self) -> dict:
+        if not self.queue or self.idx >= len(self.queue):
+            return {"mpris:trackid": GLib.Variant(
+                "o", "/io/github/IdleEndeavor/Sift/track/none")}
+        path = self.queue[self.idx]
+        try:
+            f      = MutagenFile(path, easy=True)
+            title  = _tag(f, "title") or os.path.splitext(os.path.basename(path))[0]
+            artist = _tag(f, "artist") or ""
+            album  = _tag(f, "album")  or ""
+            dur    = getattr(getattr(f, "info", None), "length", 0.0) or 0.0
+        except Exception:
+            title = os.path.basename(path)
+            artist = album = ""
+            dur = 0.0
+        meta = {
+            "mpris:trackid": GLib.Variant(
+                "o", f"/io/github/IdleEndeavor/Sift/track/{self.idx}"),
+            "xesam:title":   GLib.Variant("s", title),
+            "xesam:artist":  GLib.Variant("as", [artist] if artist else []),
+            "xesam:album":   GLib.Variant("s", album),
+            "mpris:length":  GLib.Variant("x", int(dur * 1_000_000)),
+        }
+        art_url = self._mpris_art_url()
+        if art_url:
+            meta["mpris:artUrl"] = GLib.Variant("s", art_url)
+        return meta
+
+    def _mpris_art_url(self) -> str:
+        if not self.queue or self.idx >= len(self.queue):
+            return ""
+        cover = _cover_bytes(self.queue[self.idx])
+        if not cover:
+            return ""
+        art_path = os.path.join(CLIP_DIR, "mpris_art.jpg")
+        try:
+            os.makedirs(CLIP_DIR, exist_ok=True)
+            with open(art_path, "wb") as f:
+                f.write(cover)
+            return GLib.filename_to_uri(art_path, None)
+        except Exception:
+            return ""
+
+    def _mpris_emit_props(self, player_props: dict | None = None,
+                          root_props: dict | None = None):
+        if self._mpris_conn is None:
+            return
+        try:
+            for iface, props in (
+                ("org.mpris.MediaPlayer2.Player", player_props),
+                ("org.mpris.MediaPlayer2",        root_props),
+            ):
+                if props:
+                    self._mpris_conn.emit_signal(
+                        None,
+                        "/org/mpris/MediaPlayer2",
+                        "org.freedesktop.DBus.Properties",
+                        "PropertiesChanged",
+                        GLib.Variant("(sa{sv}as)", (iface, props, [])),
+                    )
+        except Exception as e:
+            print(f"[mpris] emit_props: {e}")
 
 
 if __name__ == "__main__":
