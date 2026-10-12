@@ -42,3 +42,5 @@ Thumbs.db
 
 # ── Personal reference notes ──────────────────────────────────────────────────
 build-commands.txt
+# Claude Code local settings (machine-specific paths)
+.claude/settings.local.json
